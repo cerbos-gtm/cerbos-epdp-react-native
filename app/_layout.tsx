@@ -2,7 +2,7 @@ import {
   DarkTheme,
   DefaultTheme,
   ThemeProvider,
-} from "@react-navigation/native";
+} from "expo-router/react-navigation";
 import { useFonts } from "expo-font";
 import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
@@ -17,9 +17,12 @@ import { CerbosProvider } from "@/components/CerbosContext";
 // Prevent the splash screen from auto-hiding before asset loading is complete.
 SplashScreen.preventAutoHideAsync();
 
-// The PDP bundle URL - you might want to move this to a configuration file
-export const CERBOS_PDP_URL =
-  "https://lite.cerbos.cloud/bundle?workspace=7SRBU5GTJZKS&label=f481a2c9c90ee3ae4deae7b7f656d65d1cd608828f5853d21e9ca383d479223a";
+// The ID of the ePDP policy bundling rule to load policies from. Create one in
+// the "Embedded PDP rules" tab of your deployment in Cerbos Hub, and set
+// EXPO_PUBLIC_CERBOS_HUB_RULE_ID in a `.env` file (see `.env.example`) or
+// replace the fallback value below.
+export const CERBOS_HUB_RULE_ID =
+  process.env.EXPO_PUBLIC_CERBOS_HUB_RULE_ID ?? "REPLACE_WITH_YOUR_RULE_ID";
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -40,7 +43,7 @@ export default function RootLayout() {
   return (
     <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
       <CerbosProvider
-        pdpUrl={CERBOS_PDP_URL}
+        ruleId={CERBOS_HUB_RULE_ID}
         refreshIntervalSeconds={300}
         onDecision={(entry) => {
           console.log("Audit Log", entry);

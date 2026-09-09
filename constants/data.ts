@@ -1,5 +1,4 @@
-import { Resource } from "@cerbos/core";
-import { Principal } from "@cerbos/core/src/types/external";
+import type { Principal, Resource } from "@cerbos/core";
 
 // Define available principals
 export const principals: Principal[] = [

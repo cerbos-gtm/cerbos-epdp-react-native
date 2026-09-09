@@ -4,18 +4,14 @@ import { ResourcePicker } from "@/components/ResourcePicker";
 import { ThemedText } from "@/components/ThemedText";
 import { ThemedView } from "@/components/ThemedView";
 import { principals, resources } from "@/constants/data";
-import {
-  CheckResourcesResponse,
-  Principal,
-  Resource,
-} from "@cerbos/core/src/types/external";
+import type { CheckResourcesResponse, Principal, Resource } from "@cerbos/core";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Button, ScrollView, StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function HomeScreen() {
-  const { isLoaded, metadata } = useCerbos(); // Access Cerbos context
+  const { isLoaded, metadata, error } = useCerbos(); // Access Cerbos context
   const [principal, setPrincipal] = useState<Principal>(principals[0]); // Selected principal
   const [resource, setResource] = useState<Resource>(resources[0]); // Selected resource
 
@@ -33,7 +29,14 @@ export default function HomeScreen() {
         </ThemedView>
 
         {/* Cerbos PDP loading state */}
-        {!isLoaded && <ThemedText>Loading Cerbos PDP...</ThemedText>}
+        {!isLoaded && !error && (
+          <ThemedText style={styles.statusText}>Loading Cerbos PDP...</ThemedText>
+        )}
+        {error && (
+          <ThemedText style={[styles.statusText, styles.deniedText]}>
+            Failed to load Cerbos PDP: {error}
+          </ThemedText>
+        )}
 
         {/* Authorization check example */}
         <SampleAuthCheck
@@ -42,14 +45,19 @@ export default function HomeScreen() {
           actions={["create", "read", "update", "delete"]}
         />
 
-        {/* Display PDP load timestamp */}
+        {/* Display details of the active policy bundle */}
         {metadata && (
           <>
             <ThemedText style={styles.timestampText}>
-              Cerbos PDP loaded at: {metadata.updatedAt}
+              Policy bundle loaded at: {metadata.updatedAt} (from{" "}
+              {metadata.source})
             </ThemedText>
             <ThemedText style={styles.timestampText}>
-              Policy Commit: {metadata.commit}
+              Bundle: {metadata.bundle.bundleId} (revision{" "}
+              {metadata.bundle.ruleRevision})
+            </ThemedText>
+            <ThemedText style={styles.timestampText}>
+              Cerbos version: {metadata.cerbosVersion}
             </ThemedText>
           </>
         )}
@@ -69,7 +77,14 @@ function SampleAuthCheck({
   actions: string[];
 }) {
   const { checkResources, isLoaded } = useCerbos(); // Access Cerbos context
-  const [result, setResult] = useState<CheckResourcesResponse | null>(null);
+  // The latest outcome, remembering which inputs it was for so that it is only
+  // shown while those inputs are still selected.
+  const [outcome, setOutcome] = useState<{
+    principal: Principal;
+    resource: Resource;
+    result: CheckResourcesResponse | null;
+    error: string | null;
+  } | null>(null);
 
   // Function to check permissions
   const checkAccess = async () => {
@@ -79,17 +94,25 @@ function SampleAuthCheck({
         resources: [{ resource, actions }],
       });
       console.log("[App] Auth check result:", JSON.stringify(result));
-      setResult(result);
+      setOutcome({ principal, resource, result, error: null });
     } catch (err) {
       console.error("[App] Auth check failed:", err);
-      setResult(null);
+      setOutcome({
+        principal,
+        resource,
+        result: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   };
 
-  // Reset result when principal or resource changes
-  useEffect(() => {
-    setResult(null);
-  }, [principal, resource]);
+  // Ignore results for a different principal or resource
+  const current =
+    outcome?.principal === principal && outcome.resource === resource
+      ? outcome
+      : null;
+  const result = current?.result ?? null;
+  const checkError = current?.error ?? null;
 
   return (
     <ThemedView style={styles.stepContainer}>
@@ -112,6 +135,9 @@ function SampleAuthCheck({
           )}
         </ThemedView>
       ))}
+      {checkError && (
+        <ThemedText style={styles.deniedText}>{checkError}</ThemedText>
+      )}
     </ThemedView>
   );
 }
@@ -129,7 +155,10 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     justifyContent: "center",
   },
-
+  statusText: {
+    padding: 16,
+    textAlign: "center",
+  },
   stepContainer: {
     gap: 8,
     marginBottom: 16,
