@@ -2,7 +2,15 @@
 
 import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import { BundleService } from "@cerbos/api/cerbos/cloud/epdp/v2/epdp_pb";
-import type { CheckResourcesResponse } from "@cerbos/core";
+import {
+  PlanExpression,
+  PlanExpressionValue,
+  PlanExpressionVariable,
+  type CheckResourcesResponse,
+  type PlanExpressionOperand,
+  type PlanResourcesResponse,
+  type ValidationError,
+} from "@cerbos/core";
 import { Embedded } from "@cerbos/embedded-client";
 import { metadata as serverMetadata } from "@cerbos/embedded-server";
 import serverWasmUrl from "@cerbos/embedded-server/server.wasm";
@@ -14,11 +22,17 @@ import { useEffect, useRef, useState } from "react";
 
 import type {
   BundleMetadata,
+  DecodedJWTPayload,
+  EngineOptions,
+  HubOptions,
+  JWTToDecode,
   PDPMetadata,
+  PDPRequest,
   SerializablePDPRequests,
   SerializedBundle,
-  SerializedCheckResourcesResponse,
   SerializedDecisionLogEntry,
+  SerializedPDPResponse,
+  SerializedPlanExpressionOperand,
 } from "./cerbosTypes";
 
 // This file is an Expo DOM component: it is bundled for the web and rendered
@@ -33,6 +47,10 @@ interface CerbosEmbeddedPDPWebViewProps {
   ruleId: string;
   /** Scopes to include in the policy bundle (all scopes if empty). */
   scopes?: string[];
+  /** How to reach Cerbos Hub. */
+  hub?: HubOptions;
+  /** Engine settings for the embedded PDP. */
+  engineOptions?: EngineOptions;
   /** Cached bundle to activate immediately while checking Cerbos Hub for updates. */
   initialBundle?: SerializedBundle | null;
   /** How often (in seconds) to check Cerbos Hub for an updated bundle. `0` disables. */
@@ -47,12 +65,18 @@ interface CerbosEmbeddedPDPWebViewProps {
   handleLoadError: (message: string) => void;
   /** Invoked after each check for policy updates: `null` on success, otherwise the failure reason. */
   handleUpdateResult: (error: string | null) => void;
-  /** Invoked with the result of a successful `checkResources` call. */
-  handleResponse: (response: SerializedCheckResourcesResponse) => void;
-  /** Invoked when a `checkResources` call fails. */
+  /** Invoked with the result of a successful request. */
+  handleResponse: (requestId: string, response: SerializedPDPResponse) => void;
+  /** Invoked when a request fails. */
   handleError: (requestId: string, message: string) => void;
   /** Invoked for every decision made by the embedded PDP. */
   handleDecisionLog?: (entry: SerializedDecisionLogEntry) => void;
+  /** Invoked when a request's principal or resource attributes fail schema validation. */
+  handleValidationError?: (validationErrors: ValidationError[]) => void;
+  /** Invoked to verify and decode a JWT passed as auxiliary data. */
+  handleDecodeJWTPayload?: (
+    jwt: JWTToDecode
+  ) => DecodedJWTPayload | Promise<DecodedJWTPayload>;
   dom?: DOMProps;
 }
 
@@ -65,6 +89,8 @@ type Callbacks = Pick<
   | "handleResponse"
   | "handleError"
   | "handleDecisionLog"
+  | "handleValidationError"
+  | "handleDecodeJWTPayload"
 >;
 
 interface Bundle {
@@ -162,15 +188,19 @@ function encodeBundle(bundle: Bundle): SerializedBundle {
 async function fetchBundle(
   ruleId: string,
   scopes: string[],
+  hub: HubOptions,
   ifModifiedSince: BundleMetadata | undefined,
   signal: AbortSignal
 ): Promise<Bundle | undefined> {
   // This is the same Cerbos Hub API that `PolicyLoader` from
   // `@cerbos/embedded-client` uses; calling it directly lets us hand the
   // downloaded bundle back to React Native to cache for offline use.
-  const hub = createClient(BundleService);
+  const client = createClient(BundleService, {
+    baseUrl: hub.baseUrl,
+    credentials: hub.credentials,
+  });
 
-  const { result } = await hub.getBundle(
+  const { result } = await client.getBundle(
     {
       ruleId,
       scopes,
@@ -199,22 +229,77 @@ async function fetchBundle(
   };
 }
 
-function serializeResponse(
+function serializeCheckResourcesResponse(
   response: CheckResourcesResponse
-): SerializedCheckResourcesResponse {
+): SerializedPDPResponse {
   return {
-    requestId: response.requestId,
-    cerbosCallId: response.cerbosCallId,
-    results: response.results.map(
-      ({ resource, actions, validationErrors, metadata, outputs }) => ({
-        resource,
-        actions,
-        validationErrors,
-        metadata: metadata ?? null,
-        outputs,
-      })
-    ),
+    kind: "checkResources",
+    response: {
+      requestId: response.requestId,
+      cerbosCallId: response.cerbosCallId,
+      results: response.results.map(
+        ({ resource, actions, validationErrors, metadata, outputs }) => ({
+          resource,
+          actions,
+          validationErrors,
+          metadata: metadata ?? null,
+          outputs,
+        })
+      ),
+    },
   };
+}
+
+function serializePlanExpressionOperand(
+  operand: PlanExpressionOperand
+): SerializedPlanExpressionOperand {
+  if (operand instanceof PlanExpression) {
+    return {
+      operator: operand.operator,
+      operands: operand.operands.map(serializePlanExpressionOperand),
+    };
+  }
+  if (operand instanceof PlanExpressionValue) {
+    return { value: operand.value };
+  }
+  if (operand instanceof PlanExpressionVariable) {
+    return { name: operand.name };
+  }
+  throw new Error("Unknown plan expression operand");
+}
+
+function serializePlanResourcesResponse(
+  response: PlanResourcesResponse
+): SerializedPDPResponse {
+  return {
+    kind: "planResources",
+    response: {
+      requestId: response.requestId,
+      cerbosCallId: response.cerbosCallId,
+      kind: response.kind,
+      validationErrors: response.validationErrors,
+      metadata: response.metadata ?? null,
+      ...("condition" in response
+        ? { condition: serializePlanExpressionOperand(response.condition) }
+        : {}),
+    },
+  };
+}
+
+async function evaluate(
+  client: Embedded,
+  request: PDPRequest
+): Promise<SerializedPDPResponse> {
+  switch (request.kind) {
+    case "checkResources":
+      return serializeCheckResourcesResponse(
+        await client.checkResources(request.request)
+      );
+    case "planResources":
+      return serializePlanResourcesResponse(
+        await client.planResources(request.request)
+      );
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -224,6 +309,8 @@ function errorMessage(error: unknown): string {
 export default function CerbosEmbeddedPDPWebView({
   ruleId,
   scopes = [],
+  hub,
+  engineOptions,
   initialBundle,
   refreshIntervalSeconds,
   requests,
@@ -234,6 +321,8 @@ export default function CerbosEmbeddedPDPWebView({
   handleResponse,
   handleError,
   handleDecisionLog,
+  handleValidationError,
+  handleDecodeJWTPayload,
 }: CerbosEmbeddedPDPWebViewProps) {
   const [pdp, setPdp] = useState<ActivePDP | null>(null);
   const processedRequestIds = useRef(new Set<string>());
@@ -251,6 +340,8 @@ export default function CerbosEmbeddedPDPWebView({
     handleResponse,
     handleError,
     handleDecisionLog,
+    handleValidationError,
+    handleDecodeJWTPayload,
   });
   useEffect(() => {
     callbacks.current = {
@@ -261,6 +352,8 @@ export default function CerbosEmbeddedPDPWebView({
       handleResponse,
       handleError,
       handleDecisionLog,
+      handleValidationError,
+      handleDecodeJWTPayload,
     };
   }, [
     handleBundleDownloaded,
@@ -270,11 +363,21 @@ export default function CerbosEmbeddedPDPWebView({
     handleResponse,
     handleError,
     handleDecisionLog,
+    handleValidationError,
+    handleDecodeJWTPayload,
   ]);
 
   // `initialBundle` is only used to bootstrap; later updates come from Cerbos Hub.
   const initialBundleRef = useRef(initialBundle);
+  // Configuration objects arrive as fresh JSON on every render, so compare
+  // them by value.
   const scopesKey = JSON.stringify(scopes);
+  const hubKey = JSON.stringify(hub ?? {});
+  const engineOptionsKey = JSON.stringify(engineOptions ?? {});
+  // The engine can only invoke callbacks that were configured; the rest are
+  // proxies and would otherwise appear to exist.
+  const hasValidationErrorHandler = handleValidationError !== undefined;
+  const hasJWTDecoder = handleDecodeJWTPayload !== undefined;
 
   // Load the embedded PDP and keep its policy bundle up to date.
   useEffect(() => {
@@ -285,6 +388,8 @@ export default function CerbosEmbeddedPDPWebView({
     let initialAttempt = 0;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const scopes: string[] = JSON.parse(scopesKey);
+    const hub: HubOptions = JSON.parse(hubKey);
+    const engineOptions: EngineOptions = JSON.parse(engineOptionsKey);
 
     const activate = async (
       bundle: Bundle,
@@ -295,6 +400,7 @@ export default function CerbosEmbeddedPDPWebView({
       );
 
       const client = new Embedded({
+        ...engineOptions,
         policies: bundle.contents,
         wasm: loadServerWasm(serverWasm.current),
         onDecision: (entry) => {
@@ -316,6 +422,27 @@ export default function CerbosEmbeddedPDPWebView({
             );
           });
         },
+        onValidationError: hasValidationErrorHandler
+          ? (validationErrors) => {
+              Promise.resolve(
+                callbacks.current.handleValidationError?.(validationErrors)
+              ).catch((error: unknown) => {
+                console.warn(
+                  "[CerbosWebview] Validation error handler failed:",
+                  errorMessage(error)
+                );
+              });
+            }
+          : undefined,
+        decodeJWTPayload: hasJWTDecoder
+          ? async (jwt) => {
+              const decode = callbacks.current.handleDecodeJWTPayload;
+              if (!decode) {
+                throw new Error("No JWT decoder configured");
+              }
+              return await decode(jwt);
+            }
+          : undefined,
       });
 
       // Make sure the server starts (and the bundle loads) before reporting
@@ -342,6 +469,7 @@ export default function CerbosEmbeddedPDPWebView({
       const bundle = await fetchBundle(
         ruleId,
         scopes,
+        hub,
         active?.bundle,
         signal
       );
@@ -477,7 +605,15 @@ export default function CerbosEmbeddedPDPWebView({
       clearTimeout(timeout);
       globalThis.removeEventListener?.("online", onOnline);
     };
-  }, [ruleId, scopesKey, refreshIntervalSeconds]);
+  }, [
+    ruleId,
+    scopesKey,
+    hubKey,
+    engineOptionsKey,
+    refreshIntervalSeconds,
+    hasValidationErrorHandler,
+    hasJWTDecoder,
+  ]);
 
   // Evaluate incoming requests.
   useEffect(() => {
@@ -491,12 +627,11 @@ export default function CerbosEmbeddedPDPWebView({
       }
 
       processedRequestIds.current.add(requestId);
-      debug(`[CerbosWebview] Processing request ${requestId}`);
+      debug(`[CerbosWebview] Processing ${request.kind} request ${requestId}`);
 
-      pdp.client
-        .checkResources(request)
+      evaluate(pdp.client, request)
         .then((response) => {
-          callbacks.current.handleResponse(serializeResponse(response));
+          callbacks.current.handleResponse(requestId, response);
         })
         .catch((error: unknown) => {
           console.error(

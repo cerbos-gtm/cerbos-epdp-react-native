@@ -1,6 +1,7 @@
 import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import { PlanExpression, PlanExpressionValue, PlanExpressionVariable, PlanKind } from "@cerbos/core";
 import { act, render, waitFor } from "@testing-library/react-native";
 
 import CerbosEmbeddedPDPWebView from "../../CerbosEmbeddedPDPWebView";
@@ -13,8 +14,9 @@ import type { SerializedBundle } from "../../cerbosTypes";
 type Props = React.ComponentProps<typeof CerbosEmbeddedPDPWebView>;
 
 const mockGetBundle = jest.fn();
+const mockCreateClient = jest.fn(() => ({ getBundle: mockGetBundle }));
 jest.mock("@cerbos/hub/~internal", () => ({
-  createClient: () => ({ getBundle: mockGetBundle }),
+  createClient: (...args: unknown[]) => mockCreateClient(...(args as [])),
 }));
 
 jest.mock("@cerbos/api/cerbos/cloud/epdp/v2/epdp_pb", () => ({
@@ -38,9 +40,13 @@ interface EmbeddedOptions {
   policies: Uint8Array;
   wasm: Promise<WebAssembly.Module>;
   onDecision?: (entry: unknown) => unknown;
+  onValidationError?: (errors: unknown) => unknown;
+  decodeJWTPayload?: (jwt: unknown) => Promise<unknown>;
+  [option: string]: unknown;
 }
 const mockEmbeddedInstances: MockEmbedded[] = [];
 const mockCheckResources = jest.fn();
+const mockPlanResources = jest.fn();
 const mockServerInfo = jest.fn();
 
 class MockEmbedded {
@@ -55,6 +61,10 @@ class MockEmbedded {
 
   checkResources(request: unknown) {
     return mockCheckResources(this, request);
+  }
+
+  planResources(request: unknown) {
+    return mockPlanResources(this, request);
   }
 }
 
@@ -89,7 +99,9 @@ const wasmModule = {} as WebAssembly.Module;
 beforeEach(() => {
   mockEmbeddedInstances.length = 0;
   mockGetBundle.mockReset();
+  mockCreateClient.mockClear();
   mockCheckResources.mockReset();
+  mockPlanResources.mockReset();
   mockServerInfo.mockReset().mockResolvedValue({ version: "0.55.0-test" });
   mockWasmChecksum = bytesToHex(sha256(mockWasmBytes));
   jest.spyOn(console, "log").mockImplementation(() => {});
@@ -397,25 +409,28 @@ describe("CerbosEmbeddedPDPWebView", () => {
     const { callbacks, rerender } = await renderWebView();
     await waitFor(() => expect(callbacks.handlePDPUpdated).toHaveBeenCalled());
 
-    const requests = { "req-1": request };
+    const requests = { "req-1": { kind: "checkResources" as const, request } };
     await act(async () => {
       await rerender(element(callbacks, { requests }));
     });
 
     await waitFor(() => expect(callbacks.handleResponse).toHaveBeenCalled());
     expect(mockCheckResources).toHaveBeenCalledWith(expect.anything(), request);
-    expect(callbacks.handleResponse).toHaveBeenCalledWith({
-      requestId: "req-1",
-      cerbosCallId: "CALL1",
-      results: [
-        {
-          resource: { ...resource, policyVersion: "default", scope: "" },
-          actions: { view: "EFFECT_ALLOW" },
-          validationErrors: [],
-          metadata: null,
-          outputs: [],
-        },
-      ],
+    expect(callbacks.handleResponse).toHaveBeenCalledWith("req-1", {
+      kind: "checkResources",
+      response: {
+        requestId: "req-1",
+        cerbosCallId: "CALL1",
+        results: [
+          {
+            resource: { ...resource, policyVersion: "default", scope: "" },
+            actions: { view: "EFFECT_ALLOW" },
+            validationErrors: [],
+            metadata: null,
+            outputs: [],
+          },
+        ],
+      },
     });
     expect(callbacks.handleDecisionLog).toHaveBeenCalledWith({
       callId: "CALL1",
@@ -430,6 +445,103 @@ describe("CerbosEmbeddedPDPWebView", () => {
     expect(mockCheckResources).toHaveBeenCalledTimes(1);
   });
 
+  it("passes Hub and engine settings through, and wires the optional callbacks", async () => {
+    mockGetBundle.mockResolvedValue(hubResponse);
+    const handleValidationError = jest.fn();
+    const handleDecodeJWTPayload = jest.fn(async () => ({ sub: "alice" }));
+
+    const { callbacks } = await renderWebView({
+      hub: {
+        baseUrl: "https://hub.example.com",
+        credentials: { clientId: "id", clientSecret: "secret" },
+      },
+      engineOptions: { lenientScopeSearch: true, defaultPolicyVersion: "v2" },
+      handleValidationError,
+      handleDecodeJWTPayload,
+    });
+    await waitFor(() => expect(callbacks.handlePDPUpdated).toHaveBeenCalled());
+
+    expect(mockCreateClient).toHaveBeenCalledWith(expect.anything(), {
+      baseUrl: "https://hub.example.com",
+      credentials: { clientId: "id", clientSecret: "secret" },
+    });
+    const options = mockEmbeddedInstances[0].options;
+    expect(options).toMatchObject({
+      lenientScopeSearch: true,
+      defaultPolicyVersion: "v2",
+    });
+
+    options.onValidationError?.([{ path: "/x", message: "bad", source: "SOURCE_RESOURCE" }]);
+    expect(handleValidationError).toHaveBeenCalledWith([
+      { path: "/x", message: "bad", source: "SOURCE_RESOURCE" },
+    ]);
+    await expect(options.decodeJWTPayload?.({ token: "t" })).resolves.toEqual({
+      sub: "alice",
+    });
+    expect(handleDecodeJWTPayload).toHaveBeenCalledWith({ token: "t" });
+  });
+
+  it("leaves optional callbacks unset when the app doesn't provide them", async () => {
+    mockGetBundle.mockResolvedValue(hubResponse);
+
+    const { callbacks } = await renderWebView();
+    await waitFor(() => expect(callbacks.handlePDPUpdated).toHaveBeenCalled());
+
+    expect(mockEmbeddedInstances[0].options.onValidationError).toBeUndefined();
+    expect(mockEmbeddedInstances[0].options.decodeJWTPayload).toBeUndefined();
+  });
+
+  it("evaluates planResources requests and serialises the query plan", async () => {
+    mockGetBundle.mockResolvedValue(hubResponse);
+    const planRequest = {
+      requestId: "plan-1",
+      principal: request.principal,
+      resource: { kind: "document" },
+      action: "view",
+    };
+    mockPlanResources.mockResolvedValue({
+      requestId: "plan-1",
+      cerbosCallId: "CALL3",
+      kind: PlanKind.CONDITIONAL,
+      validationErrors: [],
+      metadata: undefined,
+      condition: new PlanExpression("eq", [
+        new PlanExpressionVariable("request.resource.attr.owner"),
+        new PlanExpressionValue("alice"),
+      ]),
+    });
+
+    const { callbacks, rerender } = await renderWebView();
+    await waitFor(() => expect(callbacks.handlePDPUpdated).toHaveBeenCalled());
+
+    await act(async () => {
+      await rerender(
+        element(callbacks, {
+          requests: {
+            "plan-1": { kind: "planResources", request: planRequest },
+          },
+        })
+      );
+    });
+
+    await waitFor(() => expect(callbacks.handleResponse).toHaveBeenCalled());
+    expect(mockPlanResources).toHaveBeenCalledWith(expect.anything(), planRequest);
+    expect(callbacks.handleResponse).toHaveBeenCalledWith("plan-1", {
+      kind: "planResources",
+      response: {
+        requestId: "plan-1",
+        cerbosCallId: "CALL3",
+        kind: PlanKind.CONDITIONAL,
+        validationErrors: [],
+        metadata: null,
+        condition: {
+          operator: "eq",
+          operands: [{ name: "request.resource.attr.owner" }, { value: "alice" }],
+        },
+      },
+    });
+  });
+
   it("reports request failures", async () => {
     mockGetBundle.mockResolvedValue(hubResponse);
     mockCheckResources.mockRejectedValue(new Error("bad request"));
@@ -438,7 +550,11 @@ describe("CerbosEmbeddedPDPWebView", () => {
     await waitFor(() => expect(callbacks.handlePDPUpdated).toHaveBeenCalled());
 
     await act(async () => {
-      await rerender(element(callbacks, { requests: { "req-1": request } }));
+      await rerender(
+        element(callbacks, {
+          requests: { "req-1": { kind: "checkResources", request } },
+        })
+      );
     });
 
     await waitFor(() =>

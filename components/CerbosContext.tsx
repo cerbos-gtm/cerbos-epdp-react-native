@@ -1,7 +1,17 @@
 import {
+  CheckResourceRequest,
   CheckResourcesRequest,
   CheckResourcesResponse,
   CheckResourcesResult,
+  IsAllowedRequest,
+  PlanExpression,
+  PlanExpressionOperand,
+  PlanExpressionValue,
+  PlanExpressionVariable,
+  PlanKind,
+  PlanResourcesRequest,
+  PlanResourcesResponse,
+  ValidationError,
 } from "@cerbos/core";
 import { randomUUID } from "expo-crypto";
 import type { DOMProps } from "expo/dom";
@@ -20,14 +30,29 @@ import { View } from "react-native";
 import { readCachedBundle, writeCachedBundle } from "./cerbosBundleCache";
 import CerbosEmbeddedPDPWebView from "./CerbosEmbeddedPDPWebView";
 import type {
+  DecodedJWTPayload,
+  EngineOptions,
+  HubOptions,
+  JWTToDecode,
   PDPMetadata,
+  PDPRequest,
   SerializablePDPRequests,
   SerializedBundle,
   SerializedCheckResourcesResponse,
   SerializedDecisionLogEntry,
+  SerializedPDPResponse,
+  SerializedPlanExpressionOperand,
+  SerializedPlanResourcesResponse,
 } from "./cerbosTypes";
 
-export type { PDPMetadata, SerializedDecisionLogEntry } from "./cerbosTypes";
+export type {
+  DecodedJWTPayload,
+  EngineOptions,
+  HubOptions,
+  JWTToDecode,
+  PDPMetadata,
+  SerializedDecisionLogEntry,
+} from "./cerbosTypes";
 
 /**
  * Lifecycle of the embedded PDP.
@@ -39,6 +64,17 @@ export type { PDPMetadata, SerializedDecisionLogEntry } from "./cerbosTypes";
  *   Loading keeps being retried in the background.
  */
 export type CerbosStatus = "loading" | "ready" | "error";
+
+/** `Omit` that distributes over unions (such as `PlanResourcesRequest`). */
+type DistributiveOmit<T, K extends keyof T> = T extends unknown
+  ? Omit<T, K>
+  : never;
+
+/** A `planResources` request without the (generated) request ID. */
+export type PlanResourcesRequestInput = DistributiveOmit<
+  PlanResourcesRequest,
+  "requestId"
+>;
 
 // The shape of the context provided to consumers.
 interface CerbosContextType {
@@ -59,6 +95,23 @@ interface CerbosContextType {
   checkResources: (
     request: Omit<CheckResourcesRequest, "requestId">
   ) => Promise<CheckResourcesResponse>;
+  /** Check a principal's permissions on a single resource. */
+  checkResource: (
+    request: Omit<CheckResourceRequest, "requestId">
+  ) => Promise<CheckResourcesResult>;
+  /**
+   * Check if a principal is allowed to perform an action on a resource.
+   *
+   * @remarks
+   * Resolves to `false` if the action is not present in the results. Like the
+   * other methods, it rejects if the PDP is not ready or the request fails:
+   * callers should treat a rejection as a denial.
+   */
+  isAllowed: (request: Omit<IsAllowedRequest, "requestId">) => Promise<boolean>;
+  /** Produce a query plan for the resources a principal may perform an action on. */
+  planResources: (
+    request: PlanResourcesRequestInput
+  ) => Promise<PlanResourcesResponse>;
 }
 
 const CerbosContext = createContext<CerbosContextType | undefined>(undefined);
@@ -72,9 +125,13 @@ export interface CerbosProviderProps {
   ruleId: string;
   /** Scopes to include in the policy bundle (default: all scopes). */
   scopes?: string[];
+  /** How to reach Cerbos Hub (default: the public API, no credentials). */
+  hub?: HubOptions;
+  /** Engine settings for the embedded PDP (default policy version, globals, schema enforcement, ...). */
+  engineOptions?: EngineOptions;
   /** How often (in seconds) to check Cerbos Hub for policy updates (default: 300). `0` disables. */
   refreshIntervalSeconds?: number;
-  /** Max time (in milliseconds) to wait for a `checkResources` response (default: 10000). */
+  /** Max time (in milliseconds) to wait for a response (default: 10000). */
   requestTimeout?: number;
   /** Time (in milliseconds) to wait for further requests before sending a batch to the WebView (default: 50). */
   batchInterval?: number;
@@ -84,12 +141,25 @@ export interface CerbosProviderProps {
   onDecision?: (decision: SerializedDecisionLogEntry) => void;
   /** Callback invoked when a check for policy updates fails (the current bundle stays active). */
   onUpdateError?: (message: string) => void;
+  /**
+   * Callback invoked when a request's principal or resource attributes fail
+   * schema validation (only with `engineOptions.schemaEnforcement` set to
+   * `warn` or `reject`).
+   */
+  onValidationError?: (validationErrors: ValidationError[]) => void;
+  /**
+   * Verifies and decodes a JWT passed as auxiliary data, returning its
+   * payload. Required to use `auxData.jwt` in requests.
+   */
+  decodeJWTPayload?: (
+    jwt: JWTToDecode
+  ) => DecodedJWTPayload | Promise<DecodedJWTPayload>;
 }
 
-// A `checkResources` call that is waiting for the WebView to answer.
+// A request that is waiting for the WebView to answer.
 interface PendingRequest {
-  request: CheckResourcesRequest;
-  resolve: (value: CheckResourcesResponse) => void;
+  request: PDPRequest;
+  resolve: (value: SerializedPDPResponse) => void;
   reject: (reason: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
   createdAt: number;
@@ -121,7 +191,7 @@ function omit<T>(record: Record<string, T>, key: string): Record<string, T> {
   return remaining;
 }
 
-function deserializeResponse(
+function deserializeCheckResourcesResponse(
   response: SerializedCheckResourcesResponse
 ): CheckResourcesResponse {
   return new CheckResourcesResponse({
@@ -138,6 +208,43 @@ function deserializeResponse(
         })
     ),
   });
+}
+
+function deserializePlanExpressionOperand(
+  operand: SerializedPlanExpressionOperand
+): PlanExpressionOperand {
+  if ("operator" in operand) {
+    return new PlanExpression(
+      operand.operator,
+      operand.operands.map(deserializePlanExpressionOperand)
+    );
+  }
+  if ("value" in operand) {
+    return new PlanExpressionValue(operand.value);
+  }
+  return new PlanExpressionVariable(operand.name);
+}
+
+function deserializePlanResourcesResponse(
+  response: SerializedPlanResourcesResponse
+): PlanResourcesResponse {
+  const base = {
+    requestId: response.requestId,
+    cerbosCallId: response.cerbosCallId,
+    validationErrors: response.validationErrors,
+    metadata: response.metadata ?? undefined,
+  };
+  if (response.kind === PlanKind.CONDITIONAL) {
+    if (!response.condition) {
+      throw new Error("Conditional query plan is missing its condition");
+    }
+    return {
+      ...base,
+      kind: PlanKind.CONDITIONAL,
+      condition: deserializePlanExpressionOperand(response.condition),
+    };
+  }
+  return { ...base, kind: response.kind };
 }
 
 /**
@@ -172,12 +279,16 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   children,
   ruleId,
   scopes,
+  hub,
+  engineOptions,
   refreshIntervalSeconds = 300,
   requestTimeout = 10_000,
   batchInterval = 50,
   maxBatchSize = 10,
   onDecision,
   onUpdateError,
+  onValidationError,
+  decodeJWTPayload,
 }) => {
   // The cached bundle read from disk at startup (`undefined` while reading).
   const [initialBundle, setInitialBundle] = useState<
@@ -244,7 +355,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     (
       requestId: string,
       outcome:
-        | { response: CheckResourcesResponse }
+        | { response: SerializedPDPResponse }
         | { error: Error; status: "failure" | "timeout" }
     ) => {
       const pending = pendingRequests.current.get(requestId);
@@ -311,20 +422,16 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     return flush;
   }, []);
 
-  const checkResources = useCallback(
-    (
-      requestData: Omit<CheckResourcesRequest, "requestId">
-    ): Promise<CheckResourcesResponse> => {
+  // Queue a request for the WebView and wait for its (serialized) response.
+  const submit = useCallback(
+    (requestId: string, request: PDPRequest): Promise<SerializedPDPResponse> => {
       if (!isLoaded) {
         return Promise.reject(
           new Error(error ?? "Cerbos PDP is not loaded yet")
         );
       }
 
-      const requestId = newRequestId();
-      const request: CheckResourcesRequest = { ...requestData, requestId };
-
-      return new Promise<CheckResourcesResponse>((resolve, reject) => {
+      return new Promise<SerializedPDPResponse>((resolve, reject) => {
         const timeout = setTimeout(() => {
           settleRequest(requestId, {
             status: "timeout",
@@ -343,7 +450,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
         });
         queuedRequestIds.current.push(requestId);
         debug(
-          `[CerbosProvider] Queued request ${requestId} (queue size: ${queuedRequestIds.current.length})`
+          `[CerbosProvider] Queued ${request.kind} request ${requestId} (queue size: ${queuedRequestIds.current.length})`
         );
 
         if (!batchTimer.current) {
@@ -355,6 +462,69 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
       });
     },
     [isLoaded, error, requestTimeout, settleRequest, flushQueue]
+  );
+
+  const checkResources = useCallback(
+    async (
+      requestData: Omit<CheckResourcesRequest, "requestId">
+    ): Promise<CheckResourcesResponse> => {
+      const requestId = newRequestId();
+      const result = await submit(requestId, {
+        kind: "checkResources",
+        request: { ...requestData, requestId },
+      });
+      if (result.kind !== "checkResources") {
+        throw new Error(`Unexpected ${result.kind} response`);
+      }
+      return deserializeCheckResourcesResponse(result.response);
+    },
+    [submit]
+  );
+
+  const checkResource = useCallback(
+    async (
+      requestData: Omit<CheckResourceRequest, "requestId">
+    ): Promise<CheckResourcesResult> => {
+      const { resource, actions, ...rest } = requestData;
+      const response = await checkResources({
+        ...rest,
+        resources: [{ resource, actions }],
+      });
+      const result = response.findResult(resource);
+      if (!result) {
+        throw new Error("No result for the requested resource");
+      }
+      return result;
+    },
+    [checkResources]
+  );
+
+  const isAllowed = useCallback(
+    async (
+      requestData: Omit<IsAllowedRequest, "requestId">
+    ): Promise<boolean> => {
+      const { action, ...rest } = requestData;
+      const result = await checkResource({ ...rest, actions: [action] });
+      return result.isAllowed(action) ?? false;
+    },
+    [checkResource]
+  );
+
+  const planResources = useCallback(
+    async (
+      requestData: PlanResourcesRequestInput
+    ): Promise<PlanResourcesResponse> => {
+      const requestId = newRequestId();
+      const result = await submit(requestId, {
+        kind: "planResources",
+        request: { ...requestData, requestId },
+      });
+      if (result.kind !== "planResources") {
+        throw new Error(`Unexpected ${result.kind} response`);
+      }
+      return deserializePlanResourcesResponse(result.response);
+    },
+    [submit]
   );
 
   // Reject anything still pending when the provider unmounts.
@@ -375,17 +545,8 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   }, []);
 
   const handleResponse = useCallback(
-    (response: SerializedCheckResourcesResponse) => {
-      try {
-        settleRequest(response.requestId, {
-          response: deserializeResponse(response),
-        });
-      } catch (caught) {
-        settleRequest(response.requestId, {
-          status: "failure",
-          error: caught instanceof Error ? caught : new Error(String(caught)),
-        });
-      }
+    (requestId: string, response: SerializedPDPResponse) => {
+      settleRequest(requestId, { response });
     },
     [settleRequest]
   );
@@ -467,13 +628,26 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   const contextValue = useMemo<CerbosContextType>(
     () => ({
       checkResources,
+      checkResource,
+      isAllowed,
+      planResources,
       metadata,
       status,
       isLoaded,
       error,
       updateError,
     }),
-    [checkResources, metadata, status, isLoaded, error, updateError]
+    [
+      checkResources,
+      checkResource,
+      isAllowed,
+      planResources,
+      metadata,
+      status,
+      isLoaded,
+      error,
+      updateError,
+    ]
   );
 
   return (
@@ -486,6 +660,8 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
           <CerbosEmbeddedPDPWebView
             ruleId={ruleId}
             scopes={scopes}
+            hub={hub}
+            engineOptions={engineOptions}
             initialBundle={initialBundle}
             refreshIntervalSeconds={refreshIntervalSeconds}
             requests={batchedRequests}
@@ -496,6 +672,8 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
             handleResponse={handleResponse}
             handleError={handleError}
             handleDecisionLog={onDecision}
+            handleValidationError={onValidationError}
+            handleDecodeJWTPayload={decodeJWTPayload}
             dom={domProps}
           />
         </View>

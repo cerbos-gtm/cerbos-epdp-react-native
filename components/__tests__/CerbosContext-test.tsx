@@ -1,4 +1,12 @@
-import { CheckResourcesResponse, Effect } from "@cerbos/core";
+import {
+  CheckResourcesResponse,
+  CheckResourcesResult,
+  Effect,
+  PlanExpression,
+  PlanExpressionValue,
+  PlanExpressionVariable,
+  PlanKind,
+} from "@cerbos/core";
 import { act, render, waitFor } from "@testing-library/react-native";
 import { useEffect } from "react";
 
@@ -9,7 +17,7 @@ import {
 } from "../CerbosContext";
 import type {
   SerializedBundle,
-  SerializedCheckResourcesResponse,
+  SerializedPDPResponse,
 } from "../cerbosTypes";
 
 // Stand in for the DOM component (which runs inside a WebView on device):
@@ -73,21 +81,22 @@ const request = {
   resources: [{ resource, actions: ["view", "edit"] }],
 };
 
-function serializedResponse(
-  requestId: string
-): SerializedCheckResourcesResponse {
+function serializedResponse(requestId: string): SerializedPDPResponse {
   return {
-    requestId,
-    cerbosCallId: "CALL1",
-    results: [
-      {
-        resource: { ...resource, policyVersion: "default", scope: "" },
-        actions: { view: Effect.ALLOW, edit: Effect.DENY },
-        validationErrors: [],
-        metadata: null,
-        outputs: [],
-      },
-    ],
+    kind: "checkResources",
+    response: {
+      requestId,
+      cerbosCallId: "CALL1",
+      results: [
+        {
+          resource: { ...resource, policyVersion: "default", scope: "" },
+          actions: { view: Effect.ALLOW, edit: Effect.DENY },
+          validationErrors: [],
+          metadata: null,
+          outputs: [],
+        },
+      ],
+    },
   };
 }
 
@@ -200,10 +209,13 @@ describe("CerbosProvider", () => {
 
     const promise = context!.checkResources(request);
     const requestId = await waitForRequest();
-    expect(mockWebViewProps!.requests[requestId]).toEqual({ ...request, requestId });
+    expect(mockWebViewProps!.requests[requestId]).toEqual({
+      kind: "checkResources",
+      request: { ...request, requestId },
+    });
 
     await act(async () => {
-      mockWebViewProps!.handleResponse(serializedResponse(requestId));
+      mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
     });
 
     const response = await promise;
@@ -248,7 +260,7 @@ describe("CerbosProvider", () => {
 
     // A late response for the timed-out request is ignored.
     await act(async () => {
-      mockWebViewProps!.handleResponse(serializedResponse(requestId));
+      mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
     });
   });
 
@@ -269,13 +281,138 @@ describe("CerbosProvider", () => {
 
     for (const requestId of Object.keys(mockWebViewProps!.requests)) {
       await act(async () => {
-        mockWebViewProps!.handleResponse(serializedResponse(requestId));
+        mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
       });
     }
 
     const responses = await Promise.all(promises);
     expect(responses.map((r) => r.requestId).slice(0, 2)).toEqual(firstBatch);
     await waitFor(() => expect(mockWebViewProps!.requests).toEqual({}));
+  });
+});
+
+describe("CerbosProvider other RPCs", () => {
+  it("answers checkResource from a checkResources round trip", async () => {
+    await renderProvider();
+    await markLoaded();
+
+    const promise = context!.checkResource({
+      principal: request.principal,
+      resource,
+      actions: ["view", "edit"],
+    });
+    const requestId = await waitForRequest();
+    expect(mockWebViewProps!.requests[requestId]).toEqual({
+      kind: "checkResources",
+      request: { ...request, requestId },
+    });
+
+    await act(async () => {
+      mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
+    });
+
+    const result = await promise;
+    expect(result).toBeInstanceOf(CheckResourcesResult);
+    expect(result.isAllowed("view")).toBe(true);
+    expect(result.isAllowed("edit")).toBe(false);
+  });
+
+  it("answers isAllowed", async () => {
+    await renderProvider();
+    await markLoaded();
+
+    const allowed = context!.isAllowed({
+      principal: request.principal,
+      resource,
+      action: "view",
+    });
+    const denied = context!.isAllowed({
+      principal: request.principal,
+      resource,
+      action: "edit",
+    });
+    await waitFor(() =>
+      expect(Object.keys(mockWebViewProps!.requests)).toHaveLength(2)
+    );
+    for (const requestId of Object.keys(mockWebViewProps!.requests)) {
+      await act(async () => {
+        mockWebViewProps!.handleResponse(
+          requestId,
+          serializedResponse(requestId)
+        );
+      });
+    }
+
+    expect(await allowed).toBe(true);
+    expect(await denied).toBe(false);
+  });
+
+  it("sends planResources requests and rebuilds the query plan", async () => {
+    await renderProvider();
+    await markLoaded();
+
+    const promise = context!.planResources({
+      principal: request.principal,
+      resource: { kind: "document" },
+      action: "view",
+    });
+    const requestId = await waitForRequest();
+    expect(mockWebViewProps!.requests[requestId]).toEqual({
+      kind: "planResources",
+      request: {
+        principal: request.principal,
+        resource: { kind: "document" },
+        action: "view",
+        requestId,
+      },
+    });
+
+    await act(async () => {
+      mockWebViewProps!.handleResponse(requestId, {
+        kind: "planResources",
+        response: {
+          requestId,
+          cerbosCallId: "CALL2",
+          kind: PlanKind.CONDITIONAL,
+          validationErrors: [],
+          metadata: null,
+          condition: {
+            operator: "eq",
+            operands: [{ name: "request.resource.attr.owner" }, { value: "alice" }],
+          },
+        },
+      });
+    });
+
+    const plan = await promise;
+    expect(plan.kind).toBe(PlanKind.CONDITIONAL);
+    if (plan.kind !== PlanKind.CONDITIONAL) {
+      throw new Error("expected a conditional plan");
+    }
+    expect(plan.condition).toBeInstanceOf(PlanExpression);
+    const condition = plan.condition as PlanExpression;
+    expect(condition.operator).toBe("eq");
+    expect(condition.operands[0]).toBeInstanceOf(PlanExpressionVariable);
+    expect(condition.operands[1]).toBeInstanceOf(PlanExpressionValue);
+    expect(plan.metadata).toBeUndefined();
+  });
+
+  it("passes Hub, engine and callback settings to the WebView", async () => {
+    const onValidationError = jest.fn();
+    const decodeJWTPayload = jest.fn();
+    await renderProvider({
+      hub: { baseUrl: "https://hub.example.com" },
+      engineOptions: { lenientScopeSearch: true },
+      onValidationError,
+      decodeJWTPayload,
+    });
+
+    expect(mockWebViewProps).toMatchObject({
+      hub: { baseUrl: "https://hub.example.com" },
+      engineOptions: { lenientScopeSearch: true },
+      handleValidationError: onValidationError,
+      handleDecodeJWTPayload: decodeJWTPayload,
+    });
   });
 });
 

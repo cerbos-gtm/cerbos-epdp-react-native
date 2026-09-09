@@ -1,190 +1,215 @@
-import { useCerbos } from "@/components/CerbosContext";
-import { PrincipalPicker } from "@/components/PrincipalPicker";
-import { ResourcePicker } from "@/components/ResourcePicker";
-import { ThemedText } from "@/components/ThemedText";
-import { ThemedView } from "@/components/ThemedView";
-import { principals, resources } from "@/constants/data";
-import type { CheckResourcesResponse, Principal, Resource } from "@cerbos/core";
-
 import { useState } from "react";
-import { Button, ScrollView, StyleSheet } from "react-native";
+import { Button, ScrollView, StyleSheet, Switch, TextInput } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-export default function HomeScreen() {
-  const { isLoaded, metadata, error, updateError } = useCerbos(); // Access Cerbos context
-  const [principal, setPrincipal] = useState<Principal>(principals[0]); // Selected principal
-  const [resource, setResource] = useState<Resource>(resources[0]); // Selected resource
+import { useCerbos, type EngineOptions } from "@/components/CerbosContext";
+import { useDemo, type DemoConfig } from "@/components/demo/DemoContext";
+import { ThemedText } from "@/components/ThemedText";
+import { ThemedView } from "@/components/ThemedView";
+
+/**
+ * Shows the state of the embedded PDP and lets you reconfigure it at runtime:
+ * the Cerbos Hub rule to load policies from, engine options and which
+ * callbacks to enable. Applying a new rule ID restarts the PDP.
+ */
+export default function EpdpScreen() {
+  const { status, metadata, error, updateError } = useCerbos();
+  const { config, applyConfig } = useDemo();
+
+  const [ruleId, setRuleId] = useState(config.ruleId);
+  const [hubBaseUrl, setHubBaseUrl] = useState(config.hubBaseUrl);
+  const [engineOptionsJson, setEngineOptionsJson] = useState(() =>
+    JSON.stringify(config.engineOptions, null, 2)
+  );
+  const [logDecisions, setLogDecisions] = useState(config.logDecisions);
+  const [logValidationErrors, setLogValidationErrors] = useState(
+    config.logValidationErrors
+  );
+  const [decodeJWTs, setDecodeJWTs] = useState(config.decodeJWTs);
+  const [configError, setConfigError] = useState<string | null>(null);
+
+  const onApply = () => {
+    let engineOptions: EngineOptions;
+    try {
+      engineOptions = JSON.parse(engineOptionsJson || "{}") as EngineOptions;
+    } catch (caught) {
+      setConfigError(
+        `Engine options are not valid JSON: ${caught instanceof Error ? caught.message : String(caught)}`
+      );
+      return;
+    }
+    if (!ruleId.trim()) {
+      setConfigError("A rule ID is required");
+      return;
+    }
+    setConfigError(null);
+    const next: DemoConfig = {
+      ruleId: ruleId.trim(),
+      hubBaseUrl: hubBaseUrl.trim() || "https://api.cerbos.cloud",
+      engineOptions,
+      logDecisions,
+      logValidationErrors,
+      decodeJWTs,
+    };
+    applyConfig(next);
+  };
 
   return (
-    <ScrollView style={{ flex: 1 }}>
+    <ScrollView style={{ flex: 1 }} keyboardShouldPersistTaps="handled">
       <SafeAreaView>
-        <ThemedView style={styles.titleContainer}>
-          <ThemedText type="title">Cerbos ePDP Demo</ThemedText>
+        <ThemedView style={styles.section}>
+          <ThemedText type="title">Cerbos ePDP</ThemedText>
+          <ThemedText style={styles.muted}>
+            An embedded policy decision point running on this device, with
+            policies from Cerbos Hub.
+          </ThemedText>
         </ThemedView>
 
-        {/* Dropdowns for selecting principal and resource */}
-        <ThemedView style={styles.dropdownContainer}>
-          <PrincipalPicker principal={principal} setPrincipal={setPrincipal} />
-          <ResourcePicker resource={resource} setResource={setResource} />
+        <ThemedView style={styles.section}>
+          <ThemedText type="subtitle">Status</ThemedText>
+          <ThemedText>
+            {status === "ready"
+              ? "Ready"
+              : status === "error"
+                ? "Failed to load"
+                : "Loading…"}
+          </ThemedText>
+          {error && <ThemedText style={styles.error}>{error}</ThemedText>}
+          {updateError && (
+            <ThemedText style={styles.error}>
+              Policy update check failed (serving the current bundle):{" "}
+              {updateError}
+            </ThemedText>
+          )}
+          {metadata && (
+            <>
+              <ThemedText style={styles.detail}>
+                Bundle {metadata.bundle.bundleId} (revision{" "}
+                {metadata.bundle.ruleRevision}), from {metadata.source}
+              </ThemedText>
+              <ThemedText style={styles.detail}>
+                Loaded at {metadata.updatedAt}
+              </ThemedText>
+              <ThemedText style={styles.detail}>
+                Cerbos {metadata.cerbosVersion}
+              </ThemedText>
+            </>
+          )}
         </ThemedView>
 
-        {/* Cerbos PDP loading state */}
-        {!isLoaded && !error && (
-          <ThemedText style={styles.statusText}>Loading Cerbos PDP...</ThemedText>
-        )}
-        {error && (
-          <ThemedText style={[styles.statusText, styles.deniedText]}>
-            Failed to load Cerbos PDP: {error}
+        <ThemedView style={styles.section}>
+          <ThemedText type="subtitle">Cerbos Hub</ThemedText>
+          <ThemedText style={styles.label}>Rule ID</ThemedText>
+          <TextInput
+            style={styles.input}
+            value={ruleId}
+            onChangeText={setRuleId}
+            autoCapitalize="characters"
+            autoCorrect={false}
+            placeholder="e.g. B5LU9EVYN1MD"
+          />
+          <ThemedText style={styles.label}>API base URL</ThemedText>
+          <TextInput
+            style={styles.input}
+            value={hubBaseUrl}
+            onChangeText={setHubBaseUrl}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="url"
+            placeholder="https://api.cerbos.cloud"
+          />
+          <ThemedText style={styles.muted}>
+            Rules downloaded directly by the app must allow public access.
+            Point the base URL at a backend of your own to use client
+            credentials without shipping them in the app.
           </ThemedText>
-        )}
+        </ThemedView>
 
-        {/* Authorization check example */}
-        <SampleAuthCheck
-          principal={principal}
-          resource={resource}
-          actions={["create", "read", "update", "delete"]}
-        />
-
-        {/* Display details of the active policy bundle */}
-        {updateError && (
-          <ThemedText style={[styles.timestampText, styles.deniedText]}>
-            Policy update check failed (serving the current bundle):{" "}
-            {updateError}
+        <ThemedView style={styles.section}>
+          <ThemedText type="subtitle">Engine options</ThemedText>
+          <TextInput
+            style={[styles.input, styles.editor]}
+            value={engineOptionsJson}
+            onChangeText={setEngineOptionsJson}
+            autoCapitalize="none"
+            autoCorrect={false}
+            multiline
+            textAlignVertical="top"
+          />
+          <ThemedText style={styles.muted}>
+            defaultPolicyVersion, defaultScope, globals, lenientScopeSearch,
+            schemaEnforcement (none, warn, reject), strictEvaluation
           </ThemedText>
-        )}
-        {metadata && (
-          <>
-            <ThemedText style={styles.timestampText}>
-              Policy bundle loaded at: {metadata.updatedAt} (from{" "}
-              {metadata.source})
-            </ThemedText>
-            <ThemedText style={styles.timestampText}>
-              Bundle: {metadata.bundle.bundleId} (revision{" "}
-              {metadata.bundle.ruleRevision})
-            </ThemedText>
-            <ThemedText style={styles.timestampText}>
-              Cerbos version: {metadata.cerbosVersion}
-            </ThemedText>
-          </>
-        )}
+        </ThemedView>
+
+        <ThemedView style={styles.section}>
+          <ThemedText type="subtitle">Callbacks</ThemedText>
+          <ThemedView style={styles.toggleRow}>
+            <ThemedText>onDecision (decision log)</ThemedText>
+            <Switch value={logDecisions} onValueChange={setLogDecisions} />
+          </ThemedView>
+          <ThemedView style={styles.toggleRow}>
+            <ThemedText>onValidationError</ThemedText>
+            <Switch
+              value={logValidationErrors}
+              onValueChange={setLogValidationErrors}
+            />
+          </ThemedView>
+          <ThemedView style={styles.toggleRow}>
+            <ThemedText>decodeJWTPayload (unverified, demo only)</ThemedText>
+            <Switch value={decodeJWTs} onValueChange={setDecodeJWTs} />
+          </ThemedView>
+        </ThemedView>
+
+        <ThemedView style={styles.section}>
+          <Button title="Apply configuration" onPress={onApply} />
+          {configError && (
+            <ThemedText style={styles.error}>{configError}</ThemedText>
+          )}
+        </ThemedView>
       </SafeAreaView>
     </ScrollView>
   );
 }
 
-// Component to perform and display authorization checks
-function SampleAuthCheck({
-  principal,
-  resource,
-  actions,
-}: {
-  principal: Principal;
-  resource: Resource;
-  actions: string[];
-}) {
-  const { checkResources, isLoaded } = useCerbos(); // Access Cerbos context
-  // The latest outcome, remembering which inputs it was for so that it is only
-  // shown while those inputs are still selected.
-  const [outcome, setOutcome] = useState<{
-    principal: Principal;
-    resource: Resource;
-    result: CheckResourcesResponse | null;
-    error: string | null;
-  } | null>(null);
-
-  // Function to check permissions
-  const checkAccess = async () => {
-    try {
-      const result = await checkResources({
-        principal,
-        resources: [{ resource, actions }],
-      });
-      if (__DEV__) {
-        console.log("[App] Auth check result:", JSON.stringify(result));
-      }
-      setOutcome({ principal, resource, result, error: null });
-    } catch (err) {
-      console.error("[App] Auth check failed:", err);
-      setOutcome({
-        principal,
-        resource,
-        result: null,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
-
-  // Ignore results for a different principal or resource
-  const current =
-    outcome?.principal === principal && outcome.resource === resource
-      ? outcome
-      : null;
-  const result = current?.result ?? null;
-  const checkError = current?.error ?? null;
-
-  return (
-    <ThemedView style={styles.stepContainer}>
-      <Button
-        title="Check Permissions"
-        onPress={checkAccess}
-        disabled={!isLoaded}
-      />
-      {actions.map((action) => (
-        <ThemedView style={styles.actionRow} key={action}>
-          <ThemedText>{action}:</ThemedText>
-          {result ? (
-            result.isAllowed({ resource, action }) ? (
-              <ThemedText style={styles.allowedText}>Allowed</ThemedText>
-            ) : (
-              <ThemedText style={styles.deniedText}>Denied</ThemedText>
-            )
-          ) : (
-            <ThemedText>-</ThemedText>
-          )}
-        </ThemedView>
-      ))}
-      {checkError && (
-        <ThemedText style={styles.deniedText}>{checkError}</ThemedText>
-      )}
-    </ThemedView>
-  );
-}
-
-// Styles for the component
 const styles = StyleSheet.create({
-  titleContainer: {
-    flexDirection: "row",
+  section: {
     gap: 8,
     padding: 16,
   },
-  dropdownContainer: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "flex-start",
-    justifyContent: "center",
+  label: {
+    fontSize: 12,
+    opacity: 0.7,
   },
-  statusText: {
-    padding: 16,
-    textAlign: "center",
+  muted: {
+    fontSize: 12,
+    opacity: 0.7,
   },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 16,
-    padding: 16,
-    borderRadius: 8,
+  detail: {
+    fontSize: 12,
   },
-  actionRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  allowedText: {
-    color: "#43A047",
-  },
-  deniedText: {
+  error: {
     color: "#E53935",
   },
-  timestampText: {
+  input: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#999",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: "#151E26",
+    backgroundColor: "#E9ECEF",
+  },
+  editor: {
+    minHeight: 120,
+    fontFamily: "SpaceMono",
     fontSize: 12,
-    textAlign: "center",
+  },
+  toggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
   },
 });

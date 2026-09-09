@@ -28,9 +28,53 @@ export default function TabLayout() {
       <Tabs.Screen
         name="index"
         options={{
-          title: "Home",
+          title: "ePDP",
           tabBarIcon: ({ color }) => (
-            <IconSymbol size={28} name="house.fill" color={color} />
+            <IconSymbol size={28} name="gearshape.fill" color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="check-resources"
+        options={{
+          title: "Check",
+          tabBarIcon: ({ color }) => (
+            <IconSymbol size={28} name="checkmark.circle.fill" color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="check-resource"
+        options={{
+          title: "Request",
+          tabBarIcon: ({ color }) => (
+            <IconSymbol size={28} name="checklist" color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="plan-resources"
+        options={{
+          title: "Plan",
+          tabBarIcon: ({ color }) => (
+            <IconSymbol
+              size={28}
+              name="list.bullet.rectangle.portrait"
+              color={color}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="audit-log"
+        options={{
+          title: "Audit",
+          tabBarIcon: ({ color }) => (
+            <IconSymbol
+              size={28}
+              name="doc.text.magnifyingglass"
+              color={color}
+            />
           ),
         }}
       />
