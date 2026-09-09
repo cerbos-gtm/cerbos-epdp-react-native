@@ -1,12 +1,20 @@
 import { File, Paths } from "expo-file-system";
+import { Platform } from "react-native";
 
 import type { SerializedBundle } from "./cerbosTypes";
 
 // Persists the most recently downloaded policy bundle so the embedded PDP can
 // start without a network connection. Bundles are stored per rule ID in the
 // app's document directory.
+//
+// Every operation is best-effort: a cache failure must never stop the PDP from
+// loading (the bundle can still be downloaded from Cerbos Hub).
 
 const CACHE_VERSION = 1;
+
+// expo-file-system has no web implementation; the browser has no persistent
+// file storage to offer here, so caching is skipped on web.
+const isSupported = Platform.OS !== "web";
 
 function cacheFile(ruleId: string): File {
   const safeRuleId = ruleId.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -22,9 +30,13 @@ function cacheFile(ruleId: string): File {
 export async function readCachedBundle(
   ruleId: string
 ): Promise<SerializedBundle | null> {
-  const file = cacheFile(ruleId);
+  if (!isSupported) {
+    return null;
+  }
 
   try {
+    const file = cacheFile(ruleId);
+
     if (!file.exists) {
       return null;
     }
@@ -57,9 +69,12 @@ export async function writeCachedBundle(
   ruleId: string,
   bundle: SerializedBundle
 ): Promise<void> {
-  const file = cacheFile(ruleId);
+  if (!isSupported) {
+    return;
+  }
 
   try {
+    const file = cacheFile(ruleId);
     file.write(JSON.stringify(bundle));
     console.log(
       `[CerbosBundleCache] Cached policy bundle ${bundle.metadata.bundleId} at ${file.uri}`
@@ -73,9 +88,12 @@ export async function writeCachedBundle(
  * Remove the cached policy bundle for a rule.
  */
 export async function clearCachedBundle(ruleId: string): Promise<void> {
-  const file = cacheFile(ruleId);
+  if (!isSupported) {
+    return;
+  }
 
   try {
+    const file = cacheFile(ruleId);
     if (file.exists) {
       file.delete();
     }

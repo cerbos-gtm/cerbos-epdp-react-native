@@ -14,7 +14,36 @@
     "lint": "expo lint"
   },
   "jest": {
-    "preset": "jest-expo"
+    "projects": [
+      {
+        "displayName": "native",
+        "preset": "jest-expo/ios",
+        "testPathIgnorePatterns": [
+          "/node_modules/",
+          "/__tests__/dom/"
+        ],
+        "transformIgnorePatterns": [
+          "/node_modules/(?!(.pnpm|@cerbos|@bufbuild|@connectrpc|ulid|uuid|react-native|@react-native|@react-native-community|expo|@expo|@expo-google-fonts|react-navigation|@react-navigation|@sentry/react-native|native-base|standard-navigation))",
+          "/node_modules/react-native-reanimated/plugin/",
+          "/node_modules/@react-native/babel-preset/"
+        ]
+      },
+      {
+        "displayName": "dom",
+        "preset": "jest-expo/web",
+        "testMatch": [
+          "<rootDir>/components/__tests__/dom/**/*-test.[jt]s?(x)"
+        ],
+        "moduleNameMapper": {
+          "\\.wasm$": "<rootDir>/test/wasmStub.js"
+        },
+        "transformIgnorePatterns": [
+          "/node_modules/(?!(.pnpm|@cerbos|@bufbuild|@connectrpc|ulid|uuid|react-native|@react-native|@react-native-community|expo|@expo|@expo-google-fonts|react-navigation|@react-navigation|@sentry/react-native|native-base|standard-navigation))",
+          "/node_modules/react-native-reanimated/plugin/",
+          "/node_modules/@react-native/babel-preset/"
+        ]
+      }
+    ]
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.14.1",

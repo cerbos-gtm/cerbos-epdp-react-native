@@ -74,6 +74,18 @@ interface PendingRequest {
   createdAt: number;
 }
 
+// Request IDs only need to be unique within this app session (they correlate
+// responses from the WebView with pending promises). `randomUUID` is native on
+// iOS/Android, but on web it requires a secure context, so fall back to a
+// non-cryptographic ID there.
+function newRequestId(): string {
+  try {
+    return randomUUID();
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  }
+}
+
 function omit<T>(record: Record<string, T>, key: string): Record<string, T> {
   if (!(key in record)) {
     return record;
@@ -149,16 +161,22 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   useEffect(() => {
     let mounted = true;
 
-    readCachedBundle(ruleId).then((bundle) => {
-      if (mounted) {
-        console.log(
-          bundle
-            ? `[CerbosProvider] Found cached policy bundle ${bundle.metadata.bundleId}`
-            : "[CerbosProvider] No cached policy bundle"
-        );
-        setInitialBundle(bundle);
-      }
-    });
+    readCachedBundle(ruleId)
+      // A cache failure must not stop the PDP from loading from Cerbos Hub.
+      .catch((caught: unknown) => {
+        console.warn("[CerbosProvider] Failed to read cached bundle:", caught);
+        return null;
+      })
+      .then((bundle) => {
+        if (mounted) {
+          console.log(
+            bundle
+              ? `[CerbosProvider] Found cached policy bundle ${bundle.metadata.bundleId}`
+              : "[CerbosProvider] No cached policy bundle"
+          );
+          setInitialBundle(bundle);
+        }
+      });
 
     return () => {
       mounted = false;
@@ -249,7 +267,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
         );
       }
 
-      const requestId = randomUUID();
+      const requestId = newRequestId();
       const request: CheckResourcesRequest = { ...requestData, requestId };
 
       return new Promise<CheckResourcesResponse>((resolve, reject) => {
