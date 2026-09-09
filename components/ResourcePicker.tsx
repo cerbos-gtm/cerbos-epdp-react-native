@@ -1,7 +1,7 @@
 import SelectDropdown from "react-native-select-dropdown";
 import { ThemedView } from "./ThemedView";
-import { principals, resources } from "@/constants/data";
-import { Resource } from "@cerbos/core/src/types/external";
+import { resources } from "@/constants/data";
+import type { Resource } from "@cerbos/core";
 import { ThemedText } from "./ThemedText";
 import { StyleSheet } from "react-native";
 

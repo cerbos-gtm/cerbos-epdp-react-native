@@ -1,167 +1,658 @@
 "use dom";
 
-import { BundleMetadata, Embedded } from "@cerbos/embedded";
-import { DOMProps } from "expo/dom";
-import { useEffect, useState, useRef } from "react";
-import { SerializablePDPRequests } from "./CerbosContext";
-import { CheckResourcesResponse as CheckResourcesResponsePB } from "@cerbos/embedded/lib/protobuf/cerbos/response/v1/response";
-import { Effect } from "@cerbos/embedded/lib/protobuf/cerbos/effect/v1/effect";
-import { DecisionLogEntry } from "@cerbos/core";
+import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
+import { BundleService } from "@cerbos/api/cerbos/cloud/epdp/v2/epdp_pb";
+import {
+  PlanExpression,
+  PlanExpressionValue,
+  PlanExpressionVariable,
+  type CheckResourcesResponse,
+  type PlanExpressionOperand,
+  type PlanResourcesResponse,
+  type ValidationError,
+} from "@cerbos/core";
+import { Embedded } from "@cerbos/embedded-client";
+import { metadata as serverMetadata } from "@cerbos/embedded-server";
+import serverWasmUrl from "@cerbos/embedded-server/server.wasm";
+import { createClient } from "@cerbos/hub/~internal";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import type { DOMProps } from "expo/dom";
+import { useEffect, useRef, useState } from "react";
 
-// Define the component's props interface
+import type {
+  BundleMetadata,
+  DecodedJWTPayload,
+  EngineOptions,
+  HubOptions,
+  JWTToDecode,
+  PDPMetadata,
+  PDPRequest,
+  SerializablePDPRequests,
+  SerializedBundle,
+  SerializedDecisionLogEntry,
+  SerializedPDPResponse,
+  SerializedPlanExpressionOperand,
+} from "./cerbosTypes";
+
+// This file is an Expo DOM component: it is bundled for the web and rendered
+// inside a WebView, because React Native has no WebAssembly runtime. The
+// embedded Cerbos PDP (a WebAssembly module shipped in
+// `@cerbos/embedded-server`) and the policy bundle from Cerbos Hub are both
+// loaded here. React Native talks to it via the (JSON-serializable) props and
+// callbacks below.
+
 interface CerbosEmbeddedPDPWebViewProps {
-  pdpb64: string;
+  /** ID of the ePDP policy bundling rule in Cerbos Hub. */
+  ruleId: string;
+  /** Scopes to include in the policy bundle (all scopes if empty). */
+  scopes?: string[];
+  /** How to reach Cerbos Hub. */
+  hub?: HubOptions;
+  /** Engine settings for the embedded PDP. */
+  engineOptions?: EngineOptions;
+  /** Cached bundle to activate immediately while checking Cerbos Hub for updates. */
+  initialBundle?: SerializedBundle | null;
+  /** How often (in seconds) to check Cerbos Hub for an updated bundle. `0` disables. */
   refreshIntervalSeconds: number;
-  loaded: (isLoaded: boolean) => void;
-  dom: DOMProps;
+  /** Pending requests to evaluate, keyed by request ID. */
   requests: SerializablePDPRequests;
-  handleResponse: (response: CheckResourcesResponsePB) => void;
-  handleDecisionLog?: (decision: DecisionLogEntry) => void;
-  handleError: (requestId: string, error: Error) => void; // Error handler callback
-  handlePDPUpdated: (metadata: { updatedAt: string } & BundleMetadata) => void; // Callback for when the PDP is updated
+  /** Invoked when a new bundle has been downloaded from Cerbos Hub and activated, so it can be cached. */
+  handleBundleDownloaded: (bundle: SerializedBundle) => void;
+  /** Invoked when a bundle has been activated in the embedded PDP. */
+  handlePDPUpdated: (metadata: PDPMetadata) => void;
+  /** Invoked when the embedded PDP could not be started (it will keep retrying). */
+  handleLoadError: (message: string) => void;
+  /** Invoked after each check for policy updates: `null` on success, otherwise the failure reason. */
+  handleUpdateResult: (error: string | null) => void;
+  /** Invoked with the result of a successful request. */
+  handleResponse: (requestId: string, response: SerializedPDPResponse) => void;
+  /** Invoked when a request fails. */
+  handleError: (requestId: string, message: string) => void;
+  /** Invoked for every decision made by the embedded PDP. */
+  handleDecisionLog?: (entry: SerializedDecisionLogEntry) => void;
+  /** Invoked when a request's principal or resource attributes fail schema validation. */
+  handleValidationError?: (validationErrors: ValidationError[]) => void;
+  /** Invoked to verify and decode a JWT passed as auxiliary data. */
+  handleDecodeJWTPayload?: (
+    jwt: JWTToDecode
+  ) => DecodedJWTPayload | Promise<DecodedJWTPayload>;
+  dom?: DOMProps;
 }
 
-function asciiToBinary(str: string) {
-  if (typeof atob === "function") {
-    // this works in the browser
-    return atob(str);
-  } else {
-    // this works in node
-    return Buffer.from(str, "base64").toString("binary");
+type Callbacks = Pick<
+  CerbosEmbeddedPDPWebViewProps,
+  | "handleBundleDownloaded"
+  | "handlePDPUpdated"
+  | "handleLoadError"
+  | "handleUpdateResult"
+  | "handleResponse"
+  | "handleError"
+  | "handleDecisionLog"
+  | "handleValidationError"
+  | "handleDecodeJWTPayload"
+>;
+
+interface Bundle {
+  metadata: BundleMetadata;
+  contents: Uint8Array<ArrayBuffer>;
+}
+
+interface ActivePDP {
+  client: Embedded;
+  bundle: BundleMetadata;
+}
+
+// Delays (in seconds) between attempts to load the first bundle from Cerbos
+// Hub when there is no cached bundle to fall back on.
+const INITIAL_RETRY_DELAYS_SECONDS = [2, 4, 8, 16, 32, 60];
+
+// Request-level logging is only useful during development, and would leak
+// principal and resource attributes into production logs.
+const debug: (...args: unknown[]) => void = __DEV__
+  ? (...args) => console.log(...args)
+  : () => {};
+
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  // `crypto.subtle` is only available in secure contexts (which excludes the
+  // plain-HTTP development server), so fall back to a pure JS implementation.
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle) {
+    return bytesToHex(new Uint8Array(await subtle.digest("SHA-256", bytes)));
+  }
+  return bytesToHex(sha256(new Uint8Array(bytes)));
+}
+
+// Holds the compiled engine so that it is only compiled once per WebView. Each
+// policy bundle update creates a new `Embedded` client, which only needs to
+// instantiate (not recompile) the module.
+interface ServerWasmCache {
+  module?: Promise<WebAssembly.Module>;
+}
+
+function loadServerWasm(cache: ServerWasmCache): Promise<WebAssembly.Module> {
+  if (!cache.module) {
+    const compiled = (async () => {
+      // `WebAssembly.compileStreaming` requires an `application/wasm` MIME
+      // type, which `file://` responses inside the WebView don't provide.
+      const response = await fetch(serverWasmUrl);
+      if (!response.ok) {
+        throw new Error(
+          `Failed to download embedded PDP from ${serverWasmUrl}: HTTP ${response.status}`
+        );
+      }
+      const bytes = await response.arrayBuffer();
+
+      // Refuse to run an engine that doesn't match the one the SDK was
+      // published with: this catches a corrupted or tampered asset.
+      const checksum = await sha256Hex(bytes);
+      if (checksum !== serverMetadata.wasmChecksum) {
+        throw new Error(
+          `Embedded PDP integrity check failed: expected SHA-256 ${serverMetadata.wasmChecksum} but got ${checksum}`
+        );
+      }
+
+      return WebAssembly.compile(bytes);
+    })();
+
+    cache.module = compiled;
+    compiled.catch(() => {
+      // Allow a later attempt to retry.
+      if (cache.module === compiled) {
+        cache.module = undefined;
+      }
+    });
+  }
+
+  return cache.module;
+}
+
+function decodeBundle(bundle: SerializedBundle): Bundle {
+  return {
+    metadata: bundle.metadata,
+    contents: base64Decode(bundle.contentsBase64),
+  };
+}
+
+function encodeBundle(bundle: Bundle): SerializedBundle {
+  return {
+    metadata: bundle.metadata,
+    contentsBase64: base64Encode(bundle.contents),
+  };
+}
+
+/**
+ * Download the latest policy bundle for the rule from Cerbos Hub.
+ * Resolves to `undefined` if the bundle hasn't changed since `ifModifiedSince`.
+ */
+async function fetchBundle(
+  ruleId: string,
+  scopes: string[],
+  hub: HubOptions,
+  ifModifiedSince: BundleMetadata | undefined,
+  signal: AbortSignal
+): Promise<Bundle | undefined> {
+  // This is the same Cerbos Hub API that `PolicyLoader` from
+  // `@cerbos/embedded-client` uses; calling it directly lets us hand the
+  // downloaded bundle back to React Native to cache for offline use.
+  const client = createClient(BundleService, {
+    baseUrl: hub.baseUrl,
+    credentials: hub.credentials,
+  });
+
+  const { result } = await client.getBundle(
+    {
+      ruleId,
+      scopes,
+      ifModifiedSince: ifModifiedSince && {
+        bundleId: ifModifiedSince.bundleId,
+        ruleRevision: BigInt(ifModifiedSince.ruleRevision),
+      },
+    },
+    { signal }
+  );
+
+  if (result.case !== "bundle") {
+    return undefined;
+  }
+
+  const { metadata, contents } = result.value;
+
+  return {
+    metadata: {
+      bundleId: metadata.bundleId,
+      ruleRevision: metadata.ruleRevision.toString(),
+    },
+    // Copy so the buffer contains exactly the bundle (the server reads the
+    // whole underlying buffer).
+    contents: new Uint8Array(contents),
+  };
+}
+
+function serializeCheckResourcesResponse(
+  response: CheckResourcesResponse
+): SerializedPDPResponse {
+  return {
+    kind: "checkResources",
+    response: {
+      requestId: response.requestId,
+      cerbosCallId: response.cerbosCallId,
+      results: response.results.map(
+        ({ resource, actions, validationErrors, metadata, outputs }) => ({
+          resource,
+          actions,
+          validationErrors,
+          metadata: metadata ?? null,
+          outputs,
+        })
+      ),
+    },
+  };
+}
+
+function serializePlanExpressionOperand(
+  operand: PlanExpressionOperand
+): SerializedPlanExpressionOperand {
+  if (operand instanceof PlanExpression) {
+    return {
+      operator: operand.operator,
+      operands: operand.operands.map(serializePlanExpressionOperand),
+    };
+  }
+  if (operand instanceof PlanExpressionValue) {
+    return { value: operand.value };
+  }
+  if (operand instanceof PlanExpressionVariable) {
+    return { name: operand.name };
+  }
+  throw new Error("Unknown plan expression operand");
+}
+
+function serializePlanResourcesResponse(
+  response: PlanResourcesResponse
+): SerializedPDPResponse {
+  return {
+    kind: "planResources",
+    response: {
+      requestId: response.requestId,
+      cerbosCallId: response.cerbosCallId,
+      kind: response.kind,
+      validationErrors: response.validationErrors,
+      metadata: response.metadata ?? null,
+      ...("condition" in response
+        ? { condition: serializePlanExpressionOperand(response.condition) }
+        : {}),
+    },
+  };
+}
+
+async function evaluate(
+  client: Embedded,
+  request: PDPRequest
+): Promise<SerializedPDPResponse> {
+  switch (request.kind) {
+    case "checkResources":
+      return serializeCheckResourcesResponse(
+        await client.checkResources(request.request)
+      );
+    case "planResources":
+      return serializePlanResourcesResponse(
+        await client.planResources(request.request)
+      );
   }
 }
 
-function decode(encoded: string) {
-  var binaryString = asciiToBinary(encoded);
-  var bytes = new Uint8Array(binaryString.length);
-  for (var i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes.buffer;
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export default function CerbosEmbeddedPDPWebView({
-  pdpb64,
+  ruleId,
+  scopes = [],
+  hub,
+  engineOptions,
+  initialBundle,
   refreshIntervalSeconds,
-  loaded,
   requests,
+  handleBundleDownloaded,
+  handlePDPUpdated,
+  handleLoadError,
+  handleUpdateResult,
   handleResponse,
   handleError,
   handleDecisionLog,
-  handlePDPUpdated,
+  handleValidationError,
+  handleDecodeJWTPayload,
 }: CerbosEmbeddedPDPWebViewProps) {
-  const [cerbos, setCerbos] = useState<Embedded | null>(null); // Cerbos instance state
-  const processedRequestIds = useRef(new Set<string>()); // Track processed request IDs
+  const [pdp, setPdp] = useState<ActivePDP | null>(null);
+  const processedRequestIds = useRef(new Set<string>());
+  const serverWasm = useRef<ServerWasmCache>({});
 
-  // Initialize and manage the AutoUpdatingLoader
+  // Callback props are re-created every time React Native re-renders, so keep
+  // the latest versions in a ref rather than listing them as effect dependencies.
+  // (They are proxies that invoke the native callback by name, so an earlier
+  // instance keeps working too.)
+  const callbacks = useRef<Callbacks>({
+    handleBundleDownloaded,
+    handlePDPUpdated,
+    handleLoadError,
+    handleUpdateResult,
+    handleResponse,
+    handleError,
+    handleDecisionLog,
+    handleValidationError,
+    handleDecodeJWTPayload,
+  });
   useEffect(() => {
-    let mounted = true; // Track if the component is mounted
-    try {
-      console.log("[CerbosWebview] Starting policy bundle loader...");
-      setCerbos(
-        new Embedded(decode(pdpb64), {
-          onLoad: (metadata) => {
-            console.log(
-              "[CerbosWebview] Cerbos Embedded PDP loaded successfully"
-            );
-            if (mounted) {
-              handlePDPUpdated({
-                updatedAt: new Date().toISOString(), // Pass the current
-                ...metadata, // Pass metadata
-              });
-              loaded(true); // Indicate successful loading
-            }
-          },
-          onDecision(entry) {
-            handleDecisionLog?.(entry); // Pass decision log entry to handler
-          },
-        })
-      ); // Set the Cerbos instance
-    } catch (error) {
-      console.error(
-        "[CerbosWebview] Failed to initialize Cerbos Embedded PDP:",
-        error
+    callbacks.current = {
+      handleBundleDownloaded,
+      handlePDPUpdated,
+      handleLoadError,
+      handleUpdateResult,
+      handleResponse,
+      handleError,
+      handleDecisionLog,
+      handleValidationError,
+      handleDecodeJWTPayload,
+    };
+  }, [
+    handleBundleDownloaded,
+    handlePDPUpdated,
+    handleLoadError,
+    handleUpdateResult,
+    handleResponse,
+    handleError,
+    handleDecisionLog,
+    handleValidationError,
+    handleDecodeJWTPayload,
+  ]);
+
+  // `initialBundle` is only used to bootstrap; later updates come from Cerbos Hub.
+  const initialBundleRef = useRef(initialBundle);
+  // Configuration objects arrive as fresh JSON on every render, so compare
+  // them by value.
+  const scopesKey = JSON.stringify(scopes);
+  const hubKey = JSON.stringify(hub ?? {});
+  const engineOptionsKey = JSON.stringify(engineOptions ?? {});
+  // The engine can only invoke callbacks that were configured; the rest are
+  // proxies and would otherwise appear to exist.
+  const hasValidationErrorHandler = handleValidationError !== undefined;
+  const hasJWTDecoder = handleDecodeJWTPayload !== undefined;
+
+  // Load the embedded PDP and keep its policy bundle up to date.
+  useEffect(() => {
+    const abortController = new AbortController();
+    const { signal } = abortController;
+    let active: ActivePDP | null = null;
+    let loading = false;
+    let initialAttempt = 0;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const scopes: string[] = JSON.parse(scopesKey);
+    const hub: HubOptions = JSON.parse(hubKey);
+    const engineOptions: EngineOptions = JSON.parse(engineOptionsKey);
+
+    const activate = async (
+      bundle: Bundle,
+      source: PDPMetadata["source"]
+    ): Promise<void> => {
+      debug(
+        `[CerbosWebview] Activating policy bundle ${bundle.metadata.bundleId} (revision ${bundle.metadata.ruleRevision}) from ${source}`
       );
-      loaded(false); // Indicate initialization failure
+
+      const client = new Embedded({
+        ...engineOptions,
+        policies: bundle.contents,
+        wasm: loadServerWasm(serverWasm.current),
+        onDecision: (entry) => {
+          const handleDecisionLog = callbacks.current.handleDecisionLog;
+          if (!handleDecisionLog) {
+            return;
+          }
+          // `JSON.stringify` turns the `Date` timestamp into an ISO string.
+          // Don't await the round trip to React Native, so that logging
+          // doesn't delay the decision itself.
+          Promise.resolve(
+            handleDecisionLog(
+              JSON.parse(JSON.stringify(entry)) as SerializedDecisionLogEntry
+            )
+          ).catch((error: unknown) => {
+            console.warn(
+              "[CerbosWebview] Decision log handler failed:",
+              errorMessage(error)
+            );
+          });
+        },
+        onValidationError: hasValidationErrorHandler
+          ? (validationErrors) => {
+              Promise.resolve(
+                callbacks.current.handleValidationError?.(validationErrors)
+              ).catch((error: unknown) => {
+                console.warn(
+                  "[CerbosWebview] Validation error handler failed:",
+                  errorMessage(error)
+                );
+              });
+            }
+          : undefined,
+        decodeJWTPayload: hasJWTDecoder
+          ? async (jwt) => {
+              const decode = callbacks.current.handleDecodeJWTPayload;
+              if (!decode) {
+                throw new Error("No JWT decoder configured");
+              }
+              return await decode(jwt);
+            }
+          : undefined,
+      });
+
+      // Make sure the server starts (and the bundle loads) before reporting
+      // readiness. If this throws, the previously active PDP (if any) keeps
+      // answering requests.
+      await client.serverInfo();
+
+      if (signal.aborted) {
+        return;
+      }
+
+      active = { client, bundle: bundle.metadata };
+      setPdp(active);
+      callbacks.current.handlePDPUpdated({
+        updatedAt: new Date().toISOString(),
+        source,
+        bundle: bundle.metadata,
+        cerbosVersion: serverMetadata.cerbosVersion,
+      });
+    };
+
+    // Check Cerbos Hub for a newer bundle and activate it. Throws on failure.
+    const checkForUpdate = async (): Promise<void> => {
+      const bundle = await fetchBundle(
+        ruleId,
+        scopes,
+        hub,
+        active?.bundle,
+        signal
+      );
+
+      if (signal.aborted) {
+        return;
+      }
+
+      if (!bundle) {
+        debug("[CerbosWebview] Policy bundle is up to date.");
+        return;
+      }
+
+      // Only cache a bundle that the engine has successfully loaded, so a
+      // bad download can never replace a working cached bundle.
+      await activate(bundle, "hub");
+      if (!signal.aborted) {
+        callbacks.current.handleBundleDownloaded(encodeBundle(bundle));
+      }
+    };
+
+    // Check for an update, reporting the outcome. Resolves to `true` on success.
+    const tryUpdate = async (): Promise<boolean> => {
+      if (loading) {
+        return false;
+      }
+      loading = true;
+      try {
+        await checkForUpdate();
+        if (!signal.aborted) {
+          callbacks.current.handleUpdateResult(null);
+        }
+        return true;
+      } catch (error) {
+        if (signal.aborted) {
+          return false;
+        }
+        const message = errorMessage(error);
+        if (active) {
+          console.warn(
+            `[CerbosWebview] Failed to check Cerbos Hub for policy updates, continuing with the current bundle: ${message}`
+          );
+        } else {
+          console.error(
+            `[CerbosWebview] Failed to load policy bundle from Cerbos Hub: ${message}`
+          );
+          callbacks.current.handleLoadError(message);
+        }
+        callbacks.current.handleUpdateResult(message);
+        return false;
+      } finally {
+        loading = false;
+      }
+    };
+
+    const scheduleUpdateCheck = (): void => {
+      clearTimeout(timeout);
+      if (refreshIntervalSeconds <= 0 || signal.aborted) {
+        return;
+      }
+
+      timeout = setTimeout(async () => {
+        await tryUpdate();
+        scheduleUpdateCheck();
+      }, refreshIntervalSeconds * 1000);
+    };
+
+    // Until a bundle is active, keep trying Cerbos Hub with exponential backoff.
+    const scheduleInitialRetry = (): void => {
+      clearTimeout(timeout);
+      if (signal.aborted) {
+        return;
+      }
+
+      const delaySeconds =
+        INITIAL_RETRY_DELAYS_SECONDS[
+          Math.min(initialAttempt, INITIAL_RETRY_DELAYS_SECONDS.length - 1)
+        ];
+      initialAttempt++;
+      debug(
+        `[CerbosWebview] Retrying policy bundle download in ${delaySeconds}s`
+      );
+      timeout = setTimeout(() => {
+        void attemptLoad();
+      }, delaySeconds * 1000);
+    };
+
+    const attemptLoad = async (): Promise<void> => {
+      await tryUpdate();
+      if (signal.aborted) {
+        return;
+      }
+      if (active) {
+        scheduleUpdateCheck();
+      } else {
+        scheduleInitialRetry();
+      }
+    };
+
+    // Retry as soon as connectivity returns rather than waiting for the backoff.
+    const onOnline = (): void => {
+      if (!active && !loading) {
+        debug("[CerbosWebview] Back online, retrying policy bundle download");
+        void attemptLoad();
+      }
+    };
+    globalThis.addEventListener?.("online", onOnline);
+
+    const start = async (): Promise<void> => {
+      const cached = initialBundleRef.current;
+
+      if (cached) {
+        try {
+          await activate(decodeBundle(cached), "cache");
+        } catch (error) {
+          console.warn(
+            "[CerbosWebview] Failed to activate cached policy bundle:",
+            errorMessage(error)
+          );
+        }
+      }
+
+      await attemptLoad();
+    };
+
+    // Any previously activated PDP keeps answering requests until the new
+    // bundle is activated. (`CerbosProvider` remounts this component when the
+    // rule ID changes, so there is no stale PDP in that case.)
+    void start();
+
+    return () => {
+      abortController.abort();
+      clearTimeout(timeout);
+      globalThis.removeEventListener?.("online", onOnline);
+    };
+  }, [
+    ruleId,
+    scopesKey,
+    hubKey,
+    engineOptionsKey,
+    refreshIntervalSeconds,
+    hasValidationErrorHandler,
+    hasJWTDecoder,
+  ]);
+
+  // Evaluate incoming requests.
+  useEffect(() => {
+    if (!pdp) {
+      return;
     }
 
-    // Cleanup function to stop the loader on unmount
-    return () => {
-      console.log("[CerbosWebview] Stopping policy bundle loader.");
-      setCerbos(null); // Clear the Cerbos instance
-      loaded(false); // Reset loaded state
-    };
-  }, [pdpb64, refreshIntervalSeconds]); // Re-run if URL or interval changes
-
-  // Process incoming requests
-  useEffect(() => {
-    if (!cerbos) return;
-
-    Object.entries(requests).forEach(async ([requestId, requestData]) => {
+    for (const [requestId, request] of Object.entries(requests)) {
       if (processedRequestIds.current.has(requestId)) {
-        console.log(
-          `[CerbosWebview] Skipping already processed request: ${requestId}`
-        );
-        return; // Skip already processed requests
+        continue;
       }
 
-      processedRequestIds.current.add(requestId); // Mark request as processing
-      console.log("[CerbosWebview] Processing Cerbos request:", requestId);
+      processedRequestIds.current.add(requestId);
+      debug(`[CerbosWebview] Processing ${request.kind} request ${requestId}`);
 
-      try {
-        const response = await cerbos.checkResources(requestData); // Perform the check
-        console.log(
-          `[CerbosWebview] Request ${requestId} response received successfully`
-        );
-
-        // Transform and pass the response to the handler
-        handleResponse({
-          requestId: response.requestId,
-          cerbosCallId: response.cerbosCallId,
-          results: response.results.map((result) => ({
-            resource: result.resource,
-            meta: result.metadata,
-            actions: Object.fromEntries(
-              Object.entries(result.actions).map(([k, v]) => [k, Effect[v]])
-            ),
-            validationErrors: [],
-            outputs: [],
-          })),
+      evaluate(pdp.client, request)
+        .then((response) => {
+          callbacks.current.handleResponse(requestId, response);
+        })
+        .catch((error: unknown) => {
+          console.error(
+            `[CerbosWebview] Request ${requestId} failed:`,
+            errorMessage(error)
+          );
+          callbacks.current.handleError(requestId, errorMessage(error));
         });
-      } catch (error) {
-        console.error(
-          `[CerbosWebview] Error processing Cerbos request ${requestId}:`,
-          error
-        );
-        handleError(
-          requestId,
-          error instanceof Error ? error : new Error(String(error))
-        ); // Pass error to handler
-      } finally {
-        processedRequestIds.current.delete(requestId); // Remove from processing set
-      }
-    });
-  }, [cerbos, requests, handleResponse, handleError]); // Re-run if dependencies change
+    }
+  }, [pdp, requests]);
 
-  // Cleanup stale request IDs when requests are removed
+  // Forget request IDs once React Native has removed them from the queue, so
+  // the set doesn't grow indefinitely.
   useEffect(() => {
-    const currentRequestIds = new Set(Object.keys(requests));
-    const toRemove: string[] = [];
-
-    processedRequestIds.current.forEach((id) => {
-      if (!currentRequestIds.has(id)) {
-        toRemove.push(id);
+    for (const requestId of processedRequestIds.current) {
+      if (!(requestId in requests)) {
+        processedRequestIds.current.delete(requestId);
       }
-    });
-
-    toRemove.forEach((id) => {
-      console.log(
-        `[CerbosWebview] Cleaning up stale request ID from tracking: ${id}`
-      );
-      processedRequestIds.current.delete(id);
-    });
+    }
   }, [requests]);
 
-  // Render nothing as this is a background task component
+  // Nothing to display: this component only does background work.
   return null;
 }

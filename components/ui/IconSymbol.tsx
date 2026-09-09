@@ -10,12 +10,17 @@ const MAPPING = {
   // See MaterialIcons here: https://icons.expo.fyi
   // See SF Symbols in the SF Symbols app on Mac.
   'house.fill': 'home',
+  'gearshape.fill': 'settings',
+  'checkmark.circle.fill': 'check-circle',
+  checklist: 'checklist',
+  'list.bullet.rectangle.portrait': 'list-alt',
+  'doc.text.magnifyingglass': 'find-in-page',
   'paperplane.fill': 'send',
   'chevron.left.forwardslash.chevron.right': 'code',
   'chevron.right': 'chevron-right',
 } as Partial<
   Record<
-    import('expo-symbols').SymbolViewProps['name'],
+    Extract<import('expo-symbols').SymbolViewProps['name'], string>,
     React.ComponentProps<typeof MaterialIcons>['name']
   >
 >;

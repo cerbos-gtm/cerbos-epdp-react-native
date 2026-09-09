@@ -19,5 +19,15 @@
   "dependencyDashboard": true,
   "baseBranchPatterns": [
     "main"
+  ],
+  "packageRules": [
+    {
+      "description": "Keep the Cerbos SDK packages in lockstep: @cerbos/embedded-client and @cerbos/embedded-server must match.",
+      "matchPackageNames": [
+        "/^@cerbos\\//"
+      ],
+      "groupName": "cerbos-sdk",
+      "automerge": false
+    }
   ]
 }
