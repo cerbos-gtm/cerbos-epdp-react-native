@@ -11,7 +11,7 @@ import { Button, ScrollView, StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function HomeScreen() {
-  const { isLoaded, metadata, error } = useCerbos(); // Access Cerbos context
+  const { isLoaded, metadata, error, updateError } = useCerbos(); // Access Cerbos context
   const [principal, setPrincipal] = useState<Principal>(principals[0]); // Selected principal
   const [resource, setResource] = useState<Resource>(resources[0]); // Selected resource
 
@@ -46,6 +46,12 @@ export default function HomeScreen() {
         />
 
         {/* Display details of the active policy bundle */}
+        {updateError && (
+          <ThemedText style={[styles.timestampText, styles.deniedText]}>
+            Policy update check failed (serving the current bundle):{" "}
+            {updateError}
+          </ThemedText>
+        )}
         {metadata && (
           <>
             <ThemedText style={styles.timestampText}>
@@ -93,7 +99,9 @@ function SampleAuthCheck({
         principal,
         resources: [{ resource, actions }],
       });
-      console.log("[App] Auth check result:", JSON.stringify(result));
+      if (__DEV__) {
+        console.log("[App] Auth check result:", JSON.stringify(result));
+      }
       setOutcome({ principal, resource, result, error: null });
     } catch (err) {
       console.error("[App] Auth check failed:", err);

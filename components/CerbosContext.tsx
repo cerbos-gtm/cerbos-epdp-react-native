@@ -4,6 +4,7 @@ import {
   CheckResourcesResult,
 } from "@cerbos/core";
 import { randomUUID } from "expo-crypto";
+import type { DOMProps } from "expo/dom";
 import React, {
   createContext,
   ReactNode,
@@ -28,14 +29,32 @@ import type {
 
 export type { PDPMetadata, SerializedDecisionLogEntry } from "./cerbosTypes";
 
+/**
+ * Lifecycle of the embedded PDP.
+ *
+ * - `loading`: no policy bundle is active yet (starting up, or the WebView is
+ *   restarting after being killed by the OS). Requests are rejected.
+ * - `ready`: a bundle is active and requests are being evaluated.
+ * - `error`: no bundle could be loaded (no cache and Cerbos Hub unreachable).
+ *   Loading keeps being retried in the background.
+ */
+export type CerbosStatus = "loading" | "ready" | "error";
+
 // The shape of the context provided to consumers.
 interface CerbosContextType {
+  /** Current lifecycle state of the embedded PDP. */
+  status: CerbosStatus;
   /** `true` once the embedded PDP has loaded a policy bundle and can answer requests. */
   isLoaded: boolean;
   /** Details about the active policy bundle, once loaded. */
   metadata: PDPMetadata | undefined;
   /** The reason the embedded PDP failed to start, if it did. */
   error: string | undefined;
+  /**
+   * The reason the most recent check for policy updates failed, if it did.
+   * `undefined` once a check succeeds. While set, the active bundle may be stale.
+   */
+  updateError: string | undefined;
   /** Check a principal's permissions on a set of resources. */
   checkResources: (
     request: Omit<CheckResourcesRequest, "requestId">
@@ -63,6 +82,8 @@ export interface CerbosProviderProps {
   maxBatchSize?: number;
   /** Callback for decision logs produced by the embedded PDP. */
   onDecision?: (decision: SerializedDecisionLogEntry) => void;
+  /** Callback invoked when a check for policy updates fails (the current bundle stays active). */
+  onUpdateError?: (message: string) => void;
 }
 
 // A `checkResources` call that is waiting for the WebView to answer.
@@ -73,6 +94,12 @@ interface PendingRequest {
   timeout: ReturnType<typeof setTimeout>;
   createdAt: number;
 }
+
+// Request-level logging is only useful during development, and would leak
+// principal and resource attributes into production logs.
+const debug: (...args: unknown[]) => void = __DEV__
+  ? (...args) => console.log(...args)
+  : () => {};
 
 // Request IDs only need to be unique within this app session (they correlate
 // responses from the WebView with pending promises). `randomUUID` is native on
@@ -114,6 +141,22 @@ function deserializeResponse(
 }
 
 /**
+ * The WebView only ever loads the DOM component bundled with the app: from
+ * the app bundle (`file://`) in release builds and OTA updates, or from the
+ * Metro development server (`http://`) in development. Refuse anything else.
+ */
+export function isAllowedWebViewNavigation(url: string): boolean {
+  if (url.startsWith("file:") || url.startsWith("about:")) {
+    return true;
+  }
+  if (__DEV__ && /^https?:\/\//.test(url)) {
+    return true;
+  }
+  console.warn(`[CerbosProvider] Blocked WebView navigation to ${url}`);
+  return false;
+}
+
+/**
  * Runs an embedded Cerbos PDP (in a hidden WebView) and exposes it to the
  * component tree via {@link useCerbos}.
  *
@@ -134,6 +177,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   batchInterval = 50,
   maxBatchSize = 10,
   onDecision,
+  onUpdateError,
 }) => {
   // The cached bundle read from disk at startup (`undefined` while reading).
   const [initialBundle, setInitialBundle] = useState<
@@ -141,6 +185,9 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   >(undefined);
   const [metadata, setMetadata] = useState<PDPMetadata | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [updateError, setUpdateError] = useState<string | undefined>(
+    undefined
+  );
   // Requests currently handed to the WebView for evaluation.
   const [batchedRequests, setBatchedRequests] =
     useState<SerializablePDPRequests>({});
@@ -153,8 +200,17 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   useEffect(() => {
     batching.current = { batchInterval, maxBatchSize };
   }, [batchInterval, maxBatchSize]);
+  const onUpdateErrorRef = useRef(onUpdateError);
+  useEffect(() => {
+    onUpdateErrorRef.current = onUpdateError;
+  }, [onUpdateError]);
 
   const isLoaded = metadata !== undefined;
+  const status: CerbosStatus = isLoaded
+    ? "ready"
+    : error !== undefined
+      ? "error"
+      : "loading";
 
   // Load the cached bundle (if any) before starting the WebView, so that the
   // PDP can start offline.
@@ -169,7 +225,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
       })
       .then((bundle) => {
         if (mounted) {
-          console.log(
+          debug(
             bundle
               ? `[CerbosProvider] Found cached policy bundle ${bundle.metadata.bundleId}`
               : "[CerbosProvider] No cached policy bundle"
@@ -208,12 +264,10 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
 
       const elapsed = Date.now() - pending.createdAt;
       if ("response" in outcome) {
-        console.debug(
-          `[CerbosProvider] Request ${requestId} succeeded in ${elapsed}ms`
-        );
+        debug(`[CerbosProvider] Request ${requestId} succeeded in ${elapsed}ms`);
         pending.resolve(outcome.response);
       } else {
-        console.debug(
+        debug(
           `[CerbosProvider] Request ${requestId} ${outcome.status} after ${elapsed}ms`
         );
         pending.reject(outcome.error);
@@ -243,7 +297,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
             next[requestId] = pending.request;
           }
         }
-        console.log(
+        debug(
           `[CerbosProvider] Sending batch of ${batch.length} request(s) to the WebView`
         );
         return next;
@@ -288,7 +342,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
           createdAt: Date.now(),
         });
         queuedRequestIds.current.push(requestId);
-        console.debug(
+        debug(
           `[CerbosProvider] Queued request ${requestId} (queue size: ${queuedRequestIds.current.length})`
         );
 
@@ -345,7 +399,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
 
   const handleBundleDownloaded = useCallback(
     (bundle: SerializedBundle) => {
-      console.log(
+      debug(
         `[CerbosProvider] Downloaded policy bundle ${bundle.metadata.bundleId} (revision ${bundle.metadata.ruleRevision})`
       );
       void writeCachedBundle(ruleId, bundle);
@@ -354,7 +408,7 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   );
 
   const handlePDPUpdated = useCallback((updated: PDPMetadata) => {
-    console.log(
+    debug(
       `[CerbosProvider] Embedded PDP ready with bundle ${updated.bundle.bundleId} (from ${updated.source})`
     );
     setMetadata(updated);
@@ -366,9 +420,60 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     setError(message);
   }, []);
 
+  const handleUpdateResult = useCallback((message: string | null) => {
+    if (message === null) {
+      setUpdateError(undefined);
+      return;
+    }
+    console.warn(`[CerbosProvider] Policy update check failed: ${message}`);
+    setUpdateError(message);
+    onUpdateErrorRef.current?.(message);
+  }, []);
+
+  // The WebView is (re)loading: either starting up, or restarting after the
+  // OS killed its process. Either way the PDP is not ready until the DOM
+  // component reports a bundle again.
+  const handleWebViewLoadStart = useCallback(() => {
+    setMetadata((current) => {
+      if (current !== undefined) {
+        console.warn(
+          "[CerbosProvider] Cerbos WebView is reloading; waiting for the PDP to become ready again"
+        );
+      }
+      return undefined;
+    });
+  }, []);
+
+  // The WebView does background work only and never shows user content, so
+  // lock it down: no navigation away from the bundled DOM component, no
+  // pop-ups, no link previews. `react-native-webview` (rather than Expo's
+  // lighter DOM WebView) is used because it exposes these controls.
+  const domProps = useMemo<DOMProps>(
+    () => ({
+      style: { height: 0 },
+      matchContents: false,
+      useExpoDOMWebView: false,
+      onShouldStartLoadWithRequest: (request) =>
+        isAllowedWebViewNavigation(request.url),
+      onLoadStart: handleWebViewLoadStart,
+      setSupportMultipleWindows: false,
+      javaScriptCanOpenWindowsAutomatically: false,
+      allowsBackForwardNavigationGestures: false,
+      allowsLinkPreview: false,
+    }),
+    [handleWebViewLoadStart]
+  );
+
   const contextValue = useMemo<CerbosContextType>(
-    () => ({ checkResources, metadata, isLoaded, error }),
-    [checkResources, metadata, isLoaded, error]
+    () => ({
+      checkResources,
+      metadata,
+      status,
+      isLoaded,
+      error,
+      updateError,
+    }),
+    [checkResources, metadata, status, isLoaded, error, updateError]
   );
 
   return (
@@ -387,10 +492,11 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
             handleBundleDownloaded={handleBundleDownloaded}
             handlePDPUpdated={handlePDPUpdated}
             handleLoadError={handleLoadError}
+            handleUpdateResult={handleUpdateResult}
             handleResponse={handleResponse}
             handleError={handleError}
             handleDecisionLog={onDecision}
-            dom={{ style: { height: 0 }, matchContents: false }}
+            dom={domProps}
           />
         </View>
       )}

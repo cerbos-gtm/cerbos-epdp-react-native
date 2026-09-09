@@ -23,7 +23,7 @@
           "/__tests__/dom/"
         ],
         "transformIgnorePatterns": [
-          "/node_modules/(?!(.pnpm|@cerbos|@bufbuild|@connectrpc|ulid|uuid|react-native|@react-native|@react-native-community|expo|@expo|@expo-google-fonts|react-navigation|@react-navigation|@sentry/react-native|native-base|standard-navigation))",
+          "/node_modules/(?!(.pnpm|@cerbos|@bufbuild|@connectrpc|@noble|ulid|uuid|react-native|@react-native|@react-native-community|expo|@expo|@expo-google-fonts|react-navigation|@react-navigation|@sentry/react-native|native-base|standard-navigation))",
           "/node_modules/react-native-reanimated/plugin/",
           "/node_modules/@react-native/babel-preset/"
         ]
@@ -38,7 +38,7 @@
           "\\.wasm$": "<rootDir>/test/wasmStub.js"
         },
         "transformIgnorePatterns": [
-          "/node_modules/(?!(.pnpm|@cerbos|@bufbuild|@connectrpc|ulid|uuid|react-native|@react-native|@react-native-community|expo|@expo|@expo-google-fonts|react-navigation|@react-navigation|@sentry/react-native|native-base|standard-navigation))",
+          "/node_modules/(?!(.pnpm|@cerbos|@bufbuild|@connectrpc|@noble|ulid|uuid|react-native|@react-native|@react-native-community|expo|@expo|@expo-google-fonts|react-navigation|@react-navigation|@sentry/react-native|native-base|standard-navigation))",
           "/node_modules/react-native-reanimated/plugin/",
           "/node_modules/@react-native/babel-preset/"
         ]
@@ -49,10 +49,11 @@
     "@bufbuild/protobuf": "^2.14.1",
     "@cerbos/api": "^0.11.0",
     "@cerbos/core": "^0.33.0",
-    "@cerbos/embedded-client": "^0.8.0",
-    "@cerbos/embedded-server": "^0.7.1",
+    "@cerbos/embedded-client": "0.8.0",
+    "@cerbos/embedded-server": "0.7.1",
     "@cerbos/hub": "^0.6.1",
     "@expo/vector-icons": "^15.0.2",
+    "@noble/hashes": "^2.4.0",
     "expo": "~57.0.21",
     "expo-blur": "~57.0.2",
     "expo-constants": "~57.0.17",

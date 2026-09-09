@@ -2,7 +2,11 @@ import { CheckResourcesResponse, Effect } from "@cerbos/core";
 import { act, render, waitFor } from "@testing-library/react-native";
 import { useEffect } from "react";
 
-import { CerbosProvider, useCerbos } from "../CerbosContext";
+import {
+  CerbosProvider,
+  isAllowedWebViewNavigation,
+  useCerbos,
+} from "../CerbosContext";
 import type {
   SerializedBundle,
   SerializedCheckResourcesResponse,
@@ -272,6 +276,100 @@ describe("CerbosProvider", () => {
     const responses = await Promise.all(promises);
     expect(responses.map((r) => r.requestId).slice(0, 2)).toEqual(firstBatch);
     await waitFor(() => expect(mockWebViewProps!.requests).toEqual({}));
+  });
+});
+
+describe("CerbosProvider status and update reporting", () => {
+  it("reports the lifecycle status", async () => {
+    await renderProvider();
+    expect(context?.status).toBe("loading");
+
+    await act(async () => {
+      mockWebViewProps!.handleLoadError("no network");
+    });
+    await waitFor(() => expect(context?.status).toBe("error"));
+
+    await markLoaded();
+    expect(context?.status).toBe("ready");
+    expect(context?.error).toBeUndefined();
+  });
+
+  it("exposes failed update checks and notifies the app", async () => {
+    const onUpdateError = jest.fn();
+    await renderProvider({ onUpdateError });
+    await markLoaded();
+
+    await act(async () => {
+      mockWebViewProps!.handleUpdateResult("hub down");
+    });
+    await waitFor(() => expect(context?.updateError).toBe("hub down"));
+    expect(onUpdateError).toHaveBeenCalledWith("hub down");
+    // The PDP stays usable on the current bundle.
+    expect(context?.isLoaded).toBe(true);
+
+    await act(async () => {
+      mockWebViewProps!.handleUpdateResult(null);
+    });
+    await waitFor(() => expect(context?.updateError).toBeUndefined());
+    expect(onUpdateError).toHaveBeenCalledTimes(1);
+  });
+
+  it("is not ready while the WebView is reloading", async () => {
+    await renderProvider();
+    await markLoaded();
+
+    await act(async () => {
+      mockWebViewProps!.dom!.onLoadStart!({} as never);
+    });
+    await waitFor(() => expect(context?.isLoaded).toBe(false));
+    expect(context?.status).toBe("loading");
+    await expect(context!.checkResources(request)).rejects.toThrow(
+      "Cerbos PDP is not loaded yet"
+    );
+
+    // The DOM component announces the bundle again once it has restarted.
+    await markLoaded();
+  });
+
+  it("locks the WebView down", async () => {
+    await renderProvider();
+
+    expect(mockWebViewProps!.dom).toMatchObject({
+      useExpoDOMWebView: false,
+      setSupportMultipleWindows: false,
+      javaScriptCanOpenWindowsAutomatically: false,
+      allowsBackForwardNavigationGestures: false,
+      allowsLinkPreview: false,
+    });
+    const shouldStart = mockWebViewProps!.dom!.onShouldStartLoadWithRequest!;
+    expect(shouldStart({ url: "file:///app/www.bundle/x.html" } as never)).toBe(
+      true
+    );
+    expect(shouldStart({ url: "https://example.com/" } as never)).toBe(
+      __DEV__
+    );
+  });
+});
+
+describe("isAllowedWebViewNavigation", () => {
+  const dev = __DEV__;
+  afterEach(() => {
+    (globalThis as unknown as { __DEV__: boolean }).__DEV__ = dev;
+  });
+
+  it("only allows the bundled DOM component and, in development, the dev server", () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    (globalThis as unknown as { __DEV__: boolean }).__DEV__ = false;
+    expect(isAllowedWebViewNavigation("file:///app/www.bundle/x.html")).toBe(true);
+    expect(isAllowedWebViewNavigation("about:blank")).toBe(true);
+    expect(isAllowedWebViewNavigation("http://localhost:8081/x")).toBe(false);
+    expect(isAllowedWebViewNavigation("https://example.com/")).toBe(false);
+    expect(isAllowedWebViewNavigation("javascript:alert(1)")).toBe(false);
+
+    (globalThis as unknown as { __DEV__: boolean }).__DEV__ = true;
+    expect(isAllowedWebViewNavigation("http://localhost:8081/x")).toBe(true);
+    expect(isAllowedWebViewNavigation("javascript:alert(1)")).toBe(false);
   });
 });
 

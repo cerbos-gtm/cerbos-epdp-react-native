@@ -46,7 +46,15 @@ export default function RootLayout() {
         ruleId={CERBOS_HUB_RULE_ID}
         refreshIntervalSeconds={300}
         onDecision={(entry) => {
-          console.log("Audit Log", entry);
+          // Decision logs contain principal and resource attributes: only
+          // print them during development. In production, ship them to your
+          // audit pipeline instead.
+          if (__DEV__) {
+            console.log("Audit Log", entry);
+          }
+        }}
+        onUpdateError={(message) => {
+          console.warn("Cerbos policy update failed", message);
         }}
       >
         <Stack>

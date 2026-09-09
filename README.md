@@ -79,7 +79,22 @@ Every React Native implementation has its own quirks, so this reference project 
 
 - `npm run typecheck` runs the TypeScript compiler.
 - `npm run lint` runs ESLint.
-- `npm run test:ci` runs the Jest test suite once (`npm test` runs it in watch mode).
+- `npm run test:ci` runs the Jest test suite once (`npm test` runs it in watch mode). The `dom` Jest project runs the DOM component on the web platform, where the `"use dom"` module is the component itself rather than the native WebView proxy.
+
+## Hardening
+
+The integration is designed so that the app keeps working when things go wrong, without ever trusting a bad input:
+
+- **Engine integrity.** The DOM component hashes the bundled `server.wasm` and refuses to run it unless the SHA-256 matches the checksum published in `@cerbos/embedded-server`'s metadata.
+- **Last known-good bundle.** A bundle downloaded from Cerbos Hub is only cached after the engine has loaded it, so a bad download can never replace a working cached bundle. If a new bundle fails to load, the current one keeps serving.
+- **Retries.** With no cached bundle and Cerbos Hub unreachable, the download is retried with exponential backoff (2s up to 60s) and immediately when connectivity returns. Later update checks that fail are reported through `updateError` in the context and the `onUpdateError` callback, while the current bundle stays active.
+- **Status.** `useCerbos()` exposes `status` (`loading`, `ready` or `error`) in addition to `isLoaded`, `error` and `updateError`. Requests made before the PDP is ready are rejected: treat a rejection as a denial.
+- **WebView lockdown.** The hidden WebView uses `react-native-webview` with navigation restricted to the bundled DOM component (and the Metro dev server in development), no pop-ups, no multiple windows and no link previews. If the OS kills the WebView process, Expo reloads it and the provider reports `loading` until the PDP is ready again.
+- **Logging.** Request contents and decision logs are only printed in development builds.
+- **Dependencies.** `@cerbos/embedded-client` and `@cerbos/embedded-server` are pinned to matching versions and grouped in Renovate so they are always upgraded together. Because the engine is a DOM component asset, an [EAS Update](https://docs.expo.dev/eas-update/introduction/) can ship a new engine without an app store release.
+- **CI.** The GitHub Actions workflow runs the typecheck, lint, tests and an iOS and Android export (which bundles the DOM component and the engine) on every pull request.
+
+Decisions made on a device can be bypassed by a modified app, and the principal attributes are supplied by the app itself. Use the ePDP to gate the UI and to work offline, and enforce the same policies on your backend.
 
 ## Notes
 
