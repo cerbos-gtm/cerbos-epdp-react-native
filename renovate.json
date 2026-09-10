@@ -28,6 +28,23 @@
       ],
       "groupName": "cerbos-sdk",
       "automerge": false
+    },
+    {
+      "description": "Expo SDK 57 pins these packages (`npx expo install --check`). Bumping them independently breaks `npm ci` and the native build, so they are only updated via `npx expo install --fix` when the SDK is upgraded.",
+      "matchPackageNames": [
+        "react",
+        "react-dom",
+        "react-native",
+        "react-native-gesture-handler",
+        "react-native-reanimated",
+        "react-native-safe-area-context",
+        "react-native-screens",
+        "react-native-web",
+        "react-native-webview",
+        "react-native-worklets",
+        "@types/react"
+      ],
+      "enabled": false
     }
   ]
 }
