@@ -11,49 +11,34 @@ import type {
 } from "@cerbos/core";
 import type { Options as EmbeddedOptions } from "@cerbos/embedded-client";
 
-// Types shared between the React Native side (`CerbosContext`) and the DOM
-// component (`CerbosEmbeddedPDPWebView`). Everything that crosses the
-// WebView bridge must be JSON-serializable, which is why the shapes below
-// avoid class instances, `Date`s, `bigint`s and `Uint8Array`s.
+// Types shared by `CerbosContext` (React Native) and `CerbosEmbeddedPDPWebView`
+// (the WebView). Everything that crosses the bridge is JSON, so no class
+// instances, `Date`s, `bigint`s or `Uint8Array`s.
 
-/**
- * Identifies a policy bundle downloaded from Cerbos Hub. Mirrors
- * `cerbos.cloud.epdp.v2.Bundle.Metadata`, with the revision as a string so
- * that it survives JSON serialization.
- */
+/** Identifies a bundle. The revision is a string because JSON has no `bigint`. */
 export interface BundleMetadata {
   bundleId: string;
   ruleRevision: string;
 }
 
-/**
- * A policy bundle downloaded from Cerbos Hub, encoded for transport across the
- * WebView bridge and for storage on disk.
- */
+/** A policy bundle, as sent across the bridge and cached on disk. */
 export interface SerializedBundle {
   metadata: BundleMetadata;
   /** Base64-encoded bundle contents. */
   contentsBase64: string;
 }
 
-/**
- * Details about the policy decision point that is currently active.
- */
+/** The active bundle. */
 export interface PDPMetadata {
-  /** ISO 8601 timestamp of when this bundle was activated in the WebView. */
+  /** When the bundle was activated (ISO 8601). */
   updatedAt: string;
-  /** Where the active bundle came from. */
   source: "hub" | "cache";
-  /** The policy bundle being evaluated. */
   bundle: BundleMetadata;
-  /** Version of the embedded Cerbos server (the WebAssembly module). */
+  /** Version of the Cerbos engine. */
   cerbosVersion: string;
 }
 
-/**
- * Engine settings for the embedded PDP: the JSON-serializable subset of
- * `@cerbos/embedded-client`'s options.
- */
+/** The JSON-serializable subset of `@cerbos/embedded-client`'s options. */
 export type EngineOptions = Pick<
   EmbeddedOptions,
   | "defaultPolicyVersion"
@@ -64,19 +49,13 @@ export type EngineOptions = Pick<
   | "strictEvaluation"
 >;
 
-/**
- * How to reach Cerbos Hub to download policy bundles.
- */
 export interface HubOptions {
-  /** Base URL of the Cerbos Hub API (default: `https://api.cerbos.cloud`). */
+  /** Default: `https://api.cerbos.cloud`. */
   baseUrl?: string;
   /**
-   * Client credentials, for rules that are not public.
-   *
-   * @remarks
-   * Anything shipped in a mobile app can be extracted from it. Prefer public
-   * rules, or a backend of your own (set as `baseUrl`) that holds the
-   * credentials and serves bundles to the app.
+   * For rules that aren't public. Anything shipped in an app can be extracted
+   * from it, so prefer a public rule, or a backend of your own (as `baseUrl`)
+   * that holds the credentials.
    */
   credentials?: { clientId: string; clientSecret: string };
 }
@@ -87,21 +66,26 @@ export type JWTToDecode = JWT;
 /** The decoded payload (claims) of a JWT. */
 export type DecodedJWTPayload = Record<string, Value>;
 
-/**
- * A request handed to the WebView for evaluation.
- */
 export type PDPRequest =
   | { kind: "checkResources"; request: CheckResourcesRequest }
   | { kind: "planResources"; request: PlanResourcesRequest };
 
-/**
- * Pending requests, keyed by request ID, handed to the WebView for evaluation.
- */
-export type SerializablePDPRequests = Record<string, PDPRequest>;
+export interface EvaluateRequest {
+  requestId: string;
+  request: PDPRequest;
+}
 
-/**
- * JSON-safe form of `CheckResourcesResponse` from `@cerbos/core`.
- */
+export type PDPResult =
+  | { requestId: string; response: SerializedPDPResponse }
+  | { requestId: string; error: string };
+
+/** What React Native can call on the DOM component (through its `ref`). */
+export interface PDPWebViewHandle {
+  /** Evaluate a batch of requests; the results arrive in one `handleResults` call. */
+  evaluate: (batch: EvaluateRequest[]) => void;
+}
+
+/** JSON form of `CheckResourcesResponse`. */
 export interface SerializedCheckResourcesResponse {
   requestId: string;
   cerbosCallId: string;
@@ -115,18 +99,13 @@ export type SerializedCheckResourcesResult = Pick<
   metadata: CheckResourcesResult["metadata"] | null;
 };
 
-/**
- * JSON-safe form of a `PlanExpressionOperand` from `@cerbos/core` (which are
- * class instances there).
- */
+/** JSON form of `PlanExpressionOperand` (class instances in `@cerbos/core`). */
 export type SerializedPlanExpressionOperand =
   | { operator: string; operands: SerializedPlanExpressionOperand[] }
   | { value: Value }
   | { name: string };
 
-/**
- * JSON-safe form of `PlanResourcesResponse` from `@cerbos/core`.
- */
+/** JSON form of `PlanResourcesResponse`. */
 export interface SerializedPlanResourcesResponse {
   requestId: string;
   cerbosCallId: string;
@@ -137,17 +116,12 @@ export interface SerializedPlanResourcesResponse {
   condition?: SerializedPlanExpressionOperand;
 }
 
-/**
- * The result of a request, matching the `kind` of the {@link PDPRequest}.
- */
+
 export type SerializedPDPResponse =
   | { kind: "checkResources"; response: SerializedCheckResourcesResponse }
   | { kind: "planResources"; response: SerializedPlanResourcesResponse };
 
-/**
- * JSON-safe form of `DecisionLogEntry` from `@cerbos/core` (the timestamp is
- * an ISO 8601 string rather than a `Date`).
- */
+/** JSON form of `DecisionLogEntry`: the timestamp is an ISO 8601 string. */
 export type SerializedDecisionLogEntry = Omit<DecisionLogEntry, "timestamp"> & {
   timestamp: string;
 };
