@@ -1,167 +1,131 @@
-import { useCerbos } from "@/components/CerbosContext";
-import { PrincipalPicker } from "@/components/PrincipalPicker";
-import { ResourcePicker } from "@/components/ResourcePicker";
-import { ThemedText } from "@/components/ThemedText";
-import { ThemedView } from "@/components/ThemedView";
-import { principals, resources } from "@/constants/data";
 import type { CheckResourcesResponse, Principal, Resource } from "@cerbos/core";
-
 import { useState } from "react";
 import { Button, ScrollView, StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { useCerbos } from "@/components/CerbosContext";
+import { Picker } from "@/components/demo/Picker";
+import { ThemedText } from "@/components/ThemedText";
+import { ThemedView } from "@/components/ThemedView";
+import { principals, resources } from "@/constants/data";
+
+const actions = ["create", "read", "update", "delete"];
+
 /**
- * Picks a principal and a resource from the demo data and checks which
- * actions are allowed, using `checkResources`.
+ * Pick a principal and a resource, and see which actions are allowed.
  */
 export default function CheckResourcesScreen() {
-  const { isLoaded, error } = useCerbos(); // Access Cerbos context
-  const [principal, setPrincipal] = useState<Principal>(principals[0]); // Selected principal
-  const [resource, setResource] = useState<Resource>(resources[0]); // Selected resource
-
-  return (
-    <ScrollView style={{ flex: 1 }}>
-      <SafeAreaView>
-        <ThemedView style={styles.titleContainer}>
-          <ThemedText type="title">checkResources</ThemedText>
-        </ThemedView>
-
-        {/* Dropdowns for selecting principal and resource */}
-        <ThemedView style={styles.dropdownContainer}>
-          <PrincipalPicker principal={principal} setPrincipal={setPrincipal} />
-          <ResourcePicker resource={resource} setResource={setResource} />
-        </ThemedView>
-
-        {/* Cerbos PDP loading state */}
-        {!isLoaded && !error && (
-          <ThemedText style={styles.statusText}>Loading Cerbos PDP...</ThemedText>
-        )}
-        {error && (
-          <ThemedText style={[styles.statusText, styles.deniedText]}>
-            Failed to load Cerbos PDP: {error}
-          </ThemedText>
-        )}
-
-        {/* Authorization check example */}
-        <SampleAuthCheck
-          principal={principal}
-          resource={resource}
-          actions={["create", "read", "update", "delete"]}
-        />
-      </SafeAreaView>
-    </ScrollView>
-  );
-}
-
-// Component to perform and display authorization checks
-function SampleAuthCheck({
-  principal,
-  resource,
-  actions,
-}: {
-  principal: Principal;
-  resource: Resource;
-  actions: string[];
-}) {
-  const { checkResources, isLoaded } = useCerbos(); // Access Cerbos context
-  // The latest outcome, remembering which inputs it was for so that it is only
-  // shown while those inputs are still selected.
+  const { checkResources, isLoaded, error } = useCerbos();
+  const [principal, setPrincipal] = useState<Principal>(principals[0]);
+  const [resource, setResource] = useState<Resource>(resources[0]);
+  // The latest outcome, and the inputs it was for.
   const [outcome, setOutcome] = useState<{
     principal: Principal;
     resource: Resource;
-    result: CheckResourcesResponse | null;
-    error: string | null;
+    result?: CheckResourcesResponse;
+    error?: string;
   } | null>(null);
 
-  // Function to check permissions
-  const checkAccess = async () => {
+  const check = async () => {
     try {
       const result = await checkResources({
         principal,
         resources: [{ resource, actions }],
       });
-      if (__DEV__) {
-        console.log("[App] Auth check result:", JSON.stringify(result));
-      }
-      setOutcome({ principal, resource, result, error: null });
-    } catch (err) {
-      console.error("[App] Auth check failed:", err);
+      setOutcome({ principal, resource, result });
+    } catch (caught) {
       setOutcome({
         principal,
         resource,
-        result: null,
-        error: err instanceof Error ? err.message : String(err),
+        error: caught instanceof Error ? caught.message : String(caught),
       });
     }
   };
 
-  // Ignore results for a different principal or resource
+  // Only show the outcome while its inputs are still selected.
   const current =
     outcome?.principal === principal && outcome.resource === resource
       ? outcome
       : null;
-  const result = current?.result ?? null;
-  const checkError = current?.error ?? null;
 
   return (
-    <ThemedView style={styles.stepContainer}>
-      <Button
-        title="Check Permissions"
-        onPress={checkAccess}
-        disabled={!isLoaded}
-      />
-      {actions.map((action) => (
-        <ThemedView style={styles.actionRow} key={action}>
-          <ThemedText>{action}:</ThemedText>
-          {result ? (
-            result.isAllowed({ resource, action }) ? (
-              <ThemedText style={styles.allowedText}>Allowed</ThemedText>
-            ) : (
-              <ThemedText style={styles.deniedText}>Denied</ThemedText>
-            )
-          ) : (
-            <ThemedText>-</ThemedText>
+    <ScrollView style={{ flex: 1 }}>
+      <SafeAreaView>
+        <ThemedView style={styles.section}>
+          <ThemedText type="title">checkResources</ThemedText>
+        </ThemedView>
+
+        <ThemedView style={styles.pickers}>
+          <Picker
+            label="Principal"
+            items={principals}
+            selected={principal}
+            onSelect={setPrincipal}
+          />
+          <Picker
+            label="Resource"
+            items={resources}
+            selected={resource}
+            onSelect={setResource}
+          />
+        </ThemedView>
+
+        {!isLoaded && !error && (
+          <ThemedText style={styles.status}>Loading Cerbos PDP...</ThemedText>
+        )}
+        {error && (
+          <ThemedText style={[styles.status, styles.denied]}>
+            Failed to load Cerbos PDP: {error}
+          </ThemedText>
+        )}
+
+        <ThemedView style={styles.section}>
+          <Button title="Check Permissions" onPress={check} disabled={!isLoaded} />
+          {actions.map((action) => (
+            <ThemedView style={styles.row} key={action}>
+              <ThemedText>{action}:</ThemedText>
+              {current?.result ? (
+                current.result.isAllowed({ resource, action }) ? (
+                  <ThemedText style={styles.allowed}>Allowed</ThemedText>
+                ) : (
+                  <ThemedText style={styles.denied}>Denied</ThemedText>
+                )
+              ) : (
+                <ThemedText>-</ThemedText>
+              )}
+            </ThemedView>
+          ))}
+          {current?.error && (
+            <ThemedText style={styles.denied}>{current.error}</ThemedText>
           )}
         </ThemedView>
-      ))}
-      {checkError && (
-        <ThemedText style={styles.deniedText}>{checkError}</ThemedText>
-      )}
-    </ThemedView>
+      </SafeAreaView>
+    </ScrollView>
   );
 }
 
-// Styles for the component
 const styles = StyleSheet.create({
-  titleContainer: {
-    flexDirection: "row",
+  section: {
     gap: 8,
     padding: 16,
   },
-  dropdownContainer: {
-    flex: 1,
+  pickers: {
     flexDirection: "row",
     alignItems: "flex-start",
     justifyContent: "center",
   },
-  statusText: {
+  status: {
     padding: 16,
     textAlign: "center",
   },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 16,
-    padding: 16,
-    borderRadius: 8,
-  },
-  actionRow: {
+  row: {
     flexDirection: "row",
     gap: 8,
   },
-  allowedText: {
+  allowed: {
     color: "#43A047",
   },
-  deniedText: {
+  denied: {
     color: "#E53935",
   },
 });

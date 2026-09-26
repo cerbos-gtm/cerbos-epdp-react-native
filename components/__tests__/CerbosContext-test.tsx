@@ -8,7 +8,7 @@ import {
   PlanKind,
 } from "@cerbos/core";
 import { act, render, waitFor } from "@testing-library/react-native";
-import { useEffect } from "react";
+import { useEffect, useImperativeHandle as mockUseImperativeHandle } from "react";
 
 import {
   CerbosProvider,
@@ -16,25 +16,31 @@ import {
   useCerbos,
 } from "../CerbosContext";
 import type {
+  EvaluateRequest,
   SerializedBundle,
   SerializedPDPResponse,
 } from "../cerbosTypes";
 
 // Stand in for the DOM component (which runs inside a WebView on device):
-// record the props the provider passes so the test can drive the callbacks.
+// record its props and the batches sent to `ref.evaluate`, so the test can
+// answer them through the callbacks.
 type WebViewProps = React.ComponentProps<
   typeof import("../CerbosEmbeddedPDPWebView").default
 >;
 let mockWebViewProps: WebViewProps | undefined;
-const mockRequestHistory: WebViewProps["requests"][] = [];
+let mockRenderCount = 0;
+const mockBatches: EvaluateRequest[][] = [];
 
 jest.mock("../CerbosEmbeddedPDPWebView", () => ({
   __esModule: true,
-  default: (props: WebViewProps) => {
-    if (props.requests !== mockWebViewProps?.requests) {
-      mockRequestHistory.push(props.requests);
-    }
+  default: function MockWebView(props: WebViewProps) {
     mockWebViewProps = props;
+    mockRenderCount++;
+    mockUseImperativeHandle(props.ref, () => ({
+      evaluate: (batch: EvaluateRequest[]) => {
+        mockBatches.push(batch);
+      },
+    }));
     return null;
   },
 }));
@@ -104,7 +110,7 @@ async function renderProvider(
   props: Partial<React.ComponentProps<typeof CerbosProvider>> = {}
 ) {
   const result = await render(
-    <CerbosProvider ruleId="RULE1" batchInterval={5} {...props}>
+    <CerbosProvider ruleId="RULE1" {...props}>
       <Consumer />
     </CerbosProvider>
   );
@@ -120,19 +126,26 @@ async function markLoaded() {
   await waitFor(() => expect(context?.isLoaded).toBe(true));
 }
 
-async function waitForRequest(): Promise<string> {
-  let requestId = "";
-  await waitFor(() => {
-    const ids = Object.keys(mockWebViewProps!.requests);
-    expect(ids.length).toBeGreaterThan(0);
-    requestId = ids[0];
+// The requests sent to the WebView so far.
+function sentRequests(): EvaluateRequest[] {
+  return mockBatches.flat();
+}
+
+async function waitForRequest(): Promise<EvaluateRequest> {
+  await waitFor(() => expect(sentRequests().length).toBeGreaterThan(0));
+  return sentRequests()[0];
+}
+
+async function respond(requestId: string, response = serializedResponse(requestId)) {
+  await act(async () => {
+    mockWebViewProps!.handleResults([{ requestId, response }]);
   });
-  return requestId;
 }
 
 beforeEach(() => {
   mockWebViewProps = undefined;
-  mockRequestHistory.length = 0;
+  mockRenderCount = 0;
+  mockBatches.length = 0;
   context = undefined;
   mockReadCachedBundle.mockReset().mockResolvedValue(null);
   mockWriteCachedBundle.mockReset().mockResolvedValue(undefined);
@@ -150,7 +163,6 @@ describe("CerbosProvider", () => {
       scopes: ["a"],
       initialBundle: bundle,
       refreshIntervalSeconds: 42,
-      requests: {},
     });
     expect(context?.isLoaded).toBe(false);
     expect(context?.metadata).toBeUndefined();
@@ -208,15 +220,13 @@ describe("CerbosProvider", () => {
     await markLoaded();
 
     const promise = context!.checkResources(request);
-    const requestId = await waitForRequest();
-    expect(mockWebViewProps!.requests[requestId]).toEqual({
+    const { requestId, request: sent } = await waitForRequest();
+    expect(sent).toEqual({
       kind: "checkResources",
       request: { ...request, requestId },
     });
 
-    await act(async () => {
-      mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
-    });
+    await respond(requestId);
 
     const response = await promise;
     expect(response).toBeInstanceOf(CheckResourcesResponse);
@@ -224,9 +234,6 @@ describe("CerbosProvider", () => {
     expect(response.isAllowed({ resource, action: "view" })).toBe(true);
     expect(response.isAllowed({ resource, action: "edit" })).toBe(false);
     expect(response.findResult(resource)?.metadata).toBeUndefined();
-
-    // The request is removed from the queue once answered.
-    await waitFor(() => expect(mockWebViewProps!.requests).toEqual({}));
   });
 
   it("rejects requests that fail in the WebView", async () => {
@@ -235,14 +242,13 @@ describe("CerbosProvider", () => {
 
     const promise = context!.checkResources(request);
     const rejection = expect(promise).rejects.toThrow("policy exploded");
-    const requestId = await waitForRequest();
+    const { requestId } = await waitForRequest();
 
     await act(async () => {
-      mockWebViewProps!.handleError(requestId, "policy exploded");
+      mockWebViewProps!.handleResults([{ requestId, error: "policy exploded" }]);
     });
 
     await rejection;
-    await waitFor(() => expect(mockWebViewProps!.requests).toEqual({}));
   });
 
   it("rejects requests that time out", async () => {
@@ -251,43 +257,93 @@ describe("CerbosProvider", () => {
 
     const promise = context!.checkResources(request);
     promise.catch(() => {}); // handled below, once the request ID is known
-    const requestId = await waitForRequest();
+    const { requestId } = await waitForRequest();
 
     await expect(promise).rejects.toThrow(
       `Cerbos request ${requestId} timed out after 300ms`
     );
-    await waitFor(() => expect(mockWebViewProps!.requests).toEqual({}));
 
     // A late response for the timed-out request is ignored.
-    await act(async () => {
-      mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
-    });
+    await respond(requestId);
   });
 
-  it("batches concurrent requests up to the batch size", async () => {
-    await renderProvider({ maxBatchSize: 2 });
+  it("sends requests made in the same tick as one batch", async () => {
+    await renderProvider();
     await markLoaded();
 
-    mockRequestHistory.length = 0;
     const promises = [1, 2, 3].map(() => context!.checkResources(request));
 
-    // All three end up with the WebView...
-    await waitFor(() =>
-      expect(Object.keys(mockWebViewProps!.requests)).toHaveLength(3)
-    );
-    // ...but only two were handed over in the first batch.
-    const firstBatch = Object.keys(mockRequestHistory[0]);
-    expect(firstBatch).toHaveLength(2);
+    await waitFor(() => expect(mockBatches).toHaveLength(1));
+    expect(mockBatches[0]).toHaveLength(3);
 
-    for (const requestId of Object.keys(mockWebViewProps!.requests)) {
-      await act(async () => {
-        mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
-      });
-    }
+    await act(async () => {
+      mockWebViewProps!.handleResults(
+        mockBatches[0].map(({ requestId }) => ({
+          requestId,
+          response: serializedResponse(requestId),
+        }))
+      );
+    });
 
     const responses = await Promise.all(promises);
-    expect(responses.map((r) => r.requestId).slice(0, 2)).toEqual(firstBatch);
-    await waitFor(() => expect(mockWebViewProps!.requests).toEqual({}));
+    expect(responses.map((r) => r.requestId)).toEqual(
+      mockBatches[0].map((r) => r.requestId)
+    );
+  });
+
+  it("doesn't re-render the WebView for requests or parent re-renders", async () => {
+    const { rerender } = await renderProvider({ hub: { baseUrl: "https://hub" } });
+    await markLoaded();
+    const renders = mockRenderCount;
+
+    const promise = context!.checkResources(request);
+    const { requestId } = await waitForRequest();
+    await respond(requestId);
+    await promise;
+
+    // Equal (but new) objects and callbacks from the parent.
+    await rerender(
+      <CerbosProvider
+        ruleId="RULE1"
+        hub={{ baseUrl: "https://hub" }}
+        onDecision={() => {}}
+      >
+        <Consumer />
+      </CerbosProvider>
+    );
+    const withDecisions = mockRenderCount;
+    await rerender(
+      <CerbosProvider
+        ruleId="RULE1"
+        hub={{ baseUrl: "https://hub" }}
+        onDecision={() => {}}
+      >
+        <Consumer />
+      </CerbosProvider>
+    );
+
+    // Only adding `onDecision` changed what the WebView needs to know.
+    expect(withDecisions).toBe(renders + 1);
+    expect(mockRenderCount).toBe(withDecisions);
+  });
+
+  it("delivers decision logs to onDecision", async () => {
+    const onDecision = jest.fn();
+    await renderProvider({ onDecision });
+
+    const entry = { callId: "CALL1", timestamp: "2026-01-01T00:00:00.000Z" };
+    await act(async () => {
+      mockWebViewProps!.handleDecisionLogs!([entry as never, entry as never]);
+    });
+
+    expect(onDecision).toHaveBeenCalledTimes(2);
+    expect(onDecision).toHaveBeenCalledWith(entry);
+  });
+
+  it("doesn't ask the WebView for decision logs without onDecision", async () => {
+    await renderProvider();
+
+    expect(mockWebViewProps!.handleDecisionLogs).toBeUndefined();
   });
 });
 
@@ -301,15 +357,13 @@ describe("CerbosProvider other RPCs", () => {
       resource,
       actions: ["view", "edit"],
     });
-    const requestId = await waitForRequest();
-    expect(mockWebViewProps!.requests[requestId]).toEqual({
+    const { requestId, request: sent } = await waitForRequest();
+    expect(sent).toEqual({
       kind: "checkResources",
       request: { ...request, requestId },
     });
 
-    await act(async () => {
-      mockWebViewProps!.handleResponse(requestId, serializedResponse(requestId));
-    });
+    await respond(requestId);
 
     const result = await promise;
     expect(result).toBeInstanceOf(CheckResourcesResult);
@@ -331,16 +385,9 @@ describe("CerbosProvider other RPCs", () => {
       resource,
       action: "edit",
     });
-    await waitFor(() =>
-      expect(Object.keys(mockWebViewProps!.requests)).toHaveLength(2)
-    );
-    for (const requestId of Object.keys(mockWebViewProps!.requests)) {
-      await act(async () => {
-        mockWebViewProps!.handleResponse(
-          requestId,
-          serializedResponse(requestId)
-        );
-      });
+    await waitFor(() => expect(sentRequests()).toHaveLength(2));
+    for (const { requestId } of sentRequests()) {
+      await respond(requestId);
     }
 
     expect(await allowed).toBe(true);
@@ -356,8 +403,8 @@ describe("CerbosProvider other RPCs", () => {
       resource: { kind: "document" },
       action: "view",
     });
-    const requestId = await waitForRequest();
-    expect(mockWebViewProps!.requests[requestId]).toEqual({
+    const { requestId, request: sent } = await waitForRequest();
+    expect(sent).toEqual({
       kind: "planResources",
       request: {
         principal: request.principal,
@@ -367,8 +414,7 @@ describe("CerbosProvider other RPCs", () => {
       },
     });
 
-    await act(async () => {
-      mockWebViewProps!.handleResponse(requestId, {
+    await respond(requestId, {
         kind: "planResources",
         response: {
           requestId,
@@ -382,7 +428,6 @@ describe("CerbosProvider other RPCs", () => {
           },
         },
       });
-    });
 
     const plan = await promise;
     expect(plan.kind).toBe(PlanKind.CONDITIONAL);
@@ -410,9 +455,11 @@ describe("CerbosProvider other RPCs", () => {
     expect(mockWebViewProps).toMatchObject({
       hub: { baseUrl: "https://hub.example.com" },
       engineOptions: { lenientScopeSearch: true },
-      handleValidationError: onValidationError,
-      handleDecodeJWTPayload: decodeJWTPayload,
     });
+    mockWebViewProps!.handleValidationError!([]);
+    expect(onValidationError).toHaveBeenCalledWith([]);
+    mockWebViewProps!.handleDecodeJWTPayload!({ token: "t" });
+    expect(decodeJWTPayload).toHaveBeenCalledWith({ token: "t" });
   });
 });
 
