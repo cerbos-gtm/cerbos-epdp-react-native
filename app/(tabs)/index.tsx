@@ -1,19 +1,23 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, ScrollView, StyleSheet, Switch, TextInput } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useCerbos, type EngineOptions } from "@/components/CerbosContext";
 import { useDemo, type DemoConfig } from "@/components/demo/DemoContext";
+import {
+  runLatencyBenchmark,
+  type LatencyReport,
+} from "@/components/demo/latencyBenchmark";
 import { ThemedText } from "@/components/ThemedText";
 import { ThemedView } from "@/components/ThemedView";
 
 /**
- * Shows the state of the embedded PDP and lets you reconfigure it at runtime:
- * the Cerbos Hub rule to load policies from, engine options and which
- * callbacks to enable. Applying a new rule ID restarts the PDP.
+ * The PDP's status, a latency benchmark, and settings to reconfigure it at
+ * runtime. Applying a new rule ID restarts the PDP.
  */
 export default function EpdpScreen() {
-  const { status, metadata, error, updateError } = useCerbos();
+  const cerbos = useCerbos();
+  const { status, metadata, error, updateError } = cerbos;
   const { config, applyConfig } = useDemo();
 
   const [ruleId, setRuleId] = useState(config.ruleId);
@@ -27,6 +31,34 @@ export default function EpdpScreen() {
   );
   const [decodeJWTs, setDecodeJWTs] = useState(config.decodeJWTs);
   const [configError, setConfigError] = useState<string | null>(null);
+  const [benchmark, setBenchmark] = useState<LatencyReport | "running" | null>(
+    null
+  );
+
+  const onBenchmark = async () => {
+    setBenchmark("running");
+    try {
+      const report = await runLatencyBenchmark(cerbos);
+      console.log(`[bench] ${JSON.stringify(report)}`);
+      setBenchmark(report);
+    } catch (caught) {
+      console.warn("[bench] failed:", caught);
+      setBenchmark(null);
+    }
+  };
+
+  // Set EXPO_PUBLIC_CERBOS_BENCH=1 to run the benchmark once at startup.
+  const autoBenchmarked = useRef(false);
+  useEffect(() => {
+    if (
+      process.env.EXPO_PUBLIC_CERBOS_BENCH === "1" &&
+      status === "ready" &&
+      !autoBenchmarked.current
+    ) {
+      autoBenchmarked.current = true;
+      void onBenchmark();
+    }
+  });
 
   const onApply = () => {
     let engineOptions: EngineOptions;
@@ -159,6 +191,25 @@ export default function EpdpScreen() {
             <ThemedText>decodeJWTPayload (unverified, demo only)</ThemedText>
             <Switch value={decodeJWTs} onValueChange={setDecodeJWTs} />
           </ThemedView>
+        </ThemedView>
+
+        <ThemedView style={styles.section}>
+          <ThemedText type="subtitle">Latency</ThemedText>
+          <Button
+            title={benchmark === "running" ? "Running…" : "Run benchmark"}
+            onPress={onBenchmark}
+            disabled={status !== "ready" || benchmark === "running"}
+          />
+          {benchmark && benchmark !== "running" && (
+            <ThemedText style={styles.detail}>
+              {Object.entries(benchmark)
+                .map(
+                  ([name, { p50, p95 }]) =>
+                    `${name}: p50 ${p50}ms, p95 ${p95}ms`
+                )
+                .join("\n")}
+            </ThemedText>
+          )}
         </ThemedView>
 
         <ThemedView style={styles.section}>

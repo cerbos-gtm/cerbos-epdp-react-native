@@ -18,10 +18,7 @@ const defaultRequest: Omit<CheckResourceRequest, "requestId"> = {
   includeMetadata: true,
 };
 
-/**
- * Edit any `checkResource` request as JSON and run it. Useful for trying out
- * attributes, scopes, `includeMetadata` and `auxData` against your policies.
- */
+/** Try out attributes, scopes, `includeMetadata` and `auxData` against your policies. */
 export default function CheckResourceScreen() {
   const { checkResource } = useCerbos();
 

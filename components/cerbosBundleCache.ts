@@ -3,17 +3,12 @@ import { Platform } from "react-native";
 
 import type { SerializedBundle } from "./cerbosTypes";
 
-// Persists the most recently downloaded policy bundle so the embedded PDP can
-// start without a network connection. Bundles are stored per rule ID in the
-// app's document directory.
-//
-// Every operation is best-effort: a cache failure must never stop the PDP from
-// loading (the bundle can still be downloaded from Cerbos Hub).
+// Keeps the latest bundle for each rule in the app's documents directory, so
+// the PDP can start offline. Best-effort: failures are logged and ignored.
 
 const CACHE_VERSION = 1;
 
-// expo-file-system has no web implementation; the browser has no persistent
-// file storage to offer here, so caching is skipped on web.
+// expo-file-system has no web implementation.
 const isSupported = Platform.OS !== "web";
 
 function cacheFile(ruleId: string): File {
@@ -24,9 +19,6 @@ function cacheFile(ruleId: string): File {
   );
 }
 
-/**
- * Read the cached policy bundle for a rule, if there is one.
- */
 export async function readCachedBundle(
   ruleId: string
 ): Promise<SerializedBundle | null> {
@@ -62,9 +54,6 @@ export async function readCachedBundle(
   }
 }
 
-/**
- * Cache a policy bundle for a rule, replacing any previous one.
- */
 export async function writeCachedBundle(
   ruleId: string,
   bundle: SerializedBundle
@@ -76,17 +65,14 @@ export async function writeCachedBundle(
   try {
     const file = cacheFile(ruleId);
     file.write(JSON.stringify(bundle));
-    console.log(
-      `[CerbosBundleCache] Cached policy bundle ${bundle.metadata.bundleId} at ${file.uri}`
-    );
+    if (__DEV__) {
+      console.log(`[CerbosBundleCache] Cached bundle ${bundle.metadata.bundleId}`);
+    }
   } catch (error) {
     console.warn("[CerbosBundleCache] Failed to cache bundle:", error);
   }
 }
 
-/**
- * Remove the cached policy bundle for a rule.
- */
 export async function clearCachedBundle(ruleId: string): Promise<void> {
   if (!isSupported) {
     return;

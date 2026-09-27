@@ -9,16 +9,11 @@ import { ThemedView } from "@/components/ThemedView";
 interface RpcScreenProps<Request> {
   title: string;
   description: string;
-  /** The request shown in the editor initially. */
   defaultRequest: Request;
-  /** Runs the request and returns something to display. */
   run: (request: Request) => Promise<unknown>;
 }
 
-/**
- * A screen with a JSON editor for a request, a button to run it against the
- * embedded PDP, and the (JSON) result.
- */
+/** Edit a request as JSON, run it, and show the result and how long it took. */
 export function RpcScreen<Request>({
   title,
   description,

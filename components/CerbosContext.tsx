@@ -32,11 +32,13 @@ import CerbosEmbeddedPDPWebView from "./CerbosEmbeddedPDPWebView";
 import type {
   DecodedJWTPayload,
   EngineOptions,
+  EvaluateRequest,
   HubOptions,
   JWTToDecode,
   PDPMetadata,
   PDPRequest,
-  SerializablePDPRequests,
+  PDPResult,
+  PDPWebViewHandle,
   SerializedBundle,
   SerializedCheckResourcesResponse,
   SerializedDecisionLogEntry,
@@ -55,60 +57,39 @@ export type {
 } from "./cerbosTypes";
 
 /**
- * Lifecycle of the embedded PDP.
- *
- * - `loading`: no policy bundle is active yet (starting up, or the WebView is
- *   restarting after being killed by the OS). Requests are rejected.
- * - `ready`: a bundle is active and requests are being evaluated.
- * - `error`: no bundle could be loaded (no cache and Cerbos Hub unreachable).
- *   Loading keeps being retried in the background.
+ * - `loading`: no bundle is active yet (starting, or the WebView is restarting).
+ * - `ready`: requests are being evaluated.
+ * - `error`: no bundle could be loaded; loading keeps being retried.
  */
 export type CerbosStatus = "loading" | "ready" | "error";
 
-/** `Omit` that distributes over unions (such as `PlanResourcesRequest`). */
 type DistributiveOmit<T, K extends keyof T> = T extends unknown
   ? Omit<T, K>
   : never;
 
-/** A `planResources` request without the (generated) request ID. */
 export type PlanResourcesRequestInput = DistributiveOmit<
   PlanResourcesRequest,
   "requestId"
 >;
 
-// The shape of the context provided to consumers.
 interface CerbosContextType {
-  /** Current lifecycle state of the embedded PDP. */
   status: CerbosStatus;
-  /** `true` once the embedded PDP has loaded a policy bundle and can answer requests. */
+  /** `true` when `status` is `ready`. */
   isLoaded: boolean;
-  /** Details about the active policy bundle, once loaded. */
+  /** The active bundle, once loaded. */
   metadata: PDPMetadata | undefined;
-  /** The reason the embedded PDP failed to start, if it did. */
+  /** Why the PDP failed to load, if it did. */
   error: string | undefined;
-  /**
-   * The reason the most recent check for policy updates failed, if it did.
-   * `undefined` once a check succeeds. While set, the active bundle may be stale.
-   */
+  /** Why the last check for a newer bundle failed, if it did. The current bundle keeps serving. */
   updateError: string | undefined;
-  /** Check a principal's permissions on a set of resources. */
   checkResources: (
     request: Omit<CheckResourcesRequest, "requestId">
   ) => Promise<CheckResourcesResponse>;
-  /** Check a principal's permissions on a single resource. */
   checkResource: (
     request: Omit<CheckResourceRequest, "requestId">
   ) => Promise<CheckResourcesResult>;
-  /**
-   * Check if a principal is allowed to perform an action on a resource.
-   *
-   * @remarks
-   * Resolves to `false` if the action is not present in the results. Like the
-   * other methods, it rejects if the PDP is not ready or the request fails:
-   * callers should treat a rejection as a denial.
-   */
+  /** Resolves to `false` if the action isn't in the result. */
   isAllowed: (request: Omit<IsAllowedRequest, "requestId">) => Promise<boolean>;
-  /** Produce a query plan for the resources a principal may perform an action on. */
   planResources: (
     request: PlanResourcesRequestInput
   ) => Promise<PlanResourcesResponse>;
@@ -118,77 +99,42 @@ const CerbosContext = createContext<CerbosContextType | undefined>(undefined);
 
 export interface CerbosProviderProps {
   children: ReactNode;
-  /**
-   * ID of the ePDP policy bundling rule, from the "Embedded PDP rules" tab of
-   * your deployment in Cerbos Hub.
-   */
+  /** The ePDP rule ID, from your deployment's "Embedded PDP rules" tab in Cerbos Hub. */
   ruleId: string;
-  /** Scopes to include in the policy bundle (default: all scopes). */
+  /** Scopes to include in the bundle (default: all). */
   scopes?: string[];
-  /** How to reach Cerbos Hub (default: the public API, no credentials). */
+  /** Where to download bundles from (default: the public Cerbos Hub API). */
   hub?: HubOptions;
-  /** Engine settings for the embedded PDP (default policy version, globals, schema enforcement, ...). */
   engineOptions?: EngineOptions;
-  /** How often (in seconds) to check Cerbos Hub for policy updates (default: 300). `0` disables. */
+  /** Seconds between checks for a newer bundle (default: 300). `0` disables. */
   refreshIntervalSeconds?: number;
-  /** Max time (in milliseconds) to wait for a response (default: 10000). */
+  /** Milliseconds to wait for a decision before rejecting (default: 10000). */
   requestTimeout?: number;
-  /** Time (in milliseconds) to wait for further requests before sending a batch to the WebView (default: 50). */
-  batchInterval?: number;
-  /** Max number of requests per batch (default: 10). */
-  maxBatchSize?: number;
-  /** Callback for decision logs produced by the embedded PDP. */
   onDecision?: (decision: SerializedDecisionLogEntry) => void;
-  /** Callback invoked when a check for policy updates fails (the current bundle stays active). */
+  /** A check for a newer bundle failed; the current bundle keeps serving. */
   onUpdateError?: (message: string) => void;
-  /**
-   * Callback invoked when a request's principal or resource attributes fail
-   * schema validation (only with `engineOptions.schemaEnforcement` set to
-   * `warn` or `reject`).
-   */
+  /** Attributes failed schema validation (needs `engineOptions.schemaEnforcement`). */
   onValidationError?: (validationErrors: ValidationError[]) => void;
-  /**
-   * Verifies and decodes a JWT passed as auxiliary data, returning its
-   * payload. Required to use `auxData.jwt` in requests.
-   */
+  /** Verify a JWT from `auxData.jwt` and return its claims. Required to use `auxData.jwt`. */
   decodeJWTPayload?: (
     jwt: JWTToDecode
   ) => DecodedJWTPayload | Promise<DecodedJWTPayload>;
 }
 
-// A request that is waiting for the WebView to answer.
 interface PendingRequest {
-  request: PDPRequest;
   resolve: (value: SerializedPDPResponse) => void;
   reject: (reason: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
-  createdAt: number;
 }
 
-// Request-level logging is only useful during development, and would leak
-// principal and resource attributes into production logs.
-const debug: (...args: unknown[]) => void = __DEV__
-  ? (...args) => console.log(...args)
-  : () => {};
-
-// Request IDs only need to be unique within this app session (they correlate
-// responses from the WebView with pending promises). `randomUUID` is native on
-// iOS/Android, but on web it requires a secure context, so fall back to a
-// non-cryptographic ID there.
+// Request IDs only correlate responses with promises. `randomUUID` needs a
+// secure context on web, so fall back to a non-cryptographic ID there.
 function newRequestId(): string {
   try {
     return randomUUID();
   } catch {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
   }
-}
-
-function omit<T>(record: Record<string, T>, key: string): Record<string, T> {
-  if (!(key in record)) {
-    return record;
-  }
-  const { [key]: _, ...remaining } = record;
-  return remaining;
 }
 
 function deserializeCheckResourcesResponse(
@@ -248,9 +194,8 @@ function deserializePlanResourcesResponse(
 }
 
 /**
- * The WebView only ever loads the DOM component bundled with the app: from
- * the app bundle (`file://`) in release builds and OTA updates, or from the
- * Metro development server (`http://`) in development. Refuse anything else.
+ * The WebView may only load the bundled DOM component: from the app
+ * (`file://`), or from Metro (`http://`) in development.
  */
 export function isAllowedWebViewNavigation(url: string): boolean {
   if (url.startsWith("file:") || url.startsWith("about:")) {
@@ -263,15 +208,30 @@ export function isAllowedWebViewNavigation(url: string): boolean {
   return false;
 }
 
+/** Keep a value's identity while it is equal by value. */
+function useStableValue<T>(value: T): T {
+  const key = JSON.stringify(value);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useMemo(() => value, [key]);
+}
+
+/** A stable function that always calls the latest `fn`. */
+function useLatest<Args extends unknown[], R>(
+  fn: ((...args: Args) => R) | undefined
+): (...args: Args) => R {
+  const ref = useRef(fn);
+  useEffect(() => {
+    ref.current = fn;
+  });
+  return useCallback((...args: Args) => ref.current!(...args), []);
+}
+
 /**
- * Runs an embedded Cerbos PDP (in a hidden WebView) and exposes it to the
- * component tree via {@link useCerbos}.
- *
- * The policy bundle is downloaded from Cerbos Hub and cached on device, so
- * that the PDP keeps working offline and starts quickly on subsequent launches.
+ * Runs an embedded Cerbos PDP in a hidden WebView and provides it through
+ * {@link useCerbos}. Bundles come from Cerbos Hub and are cached on device.
  */
 export const CerbosProvider: React.FC<CerbosProviderProps> = (props) => {
-  // Remount (and so reset all state) when the rule changes.
+  // Start from scratch when the rule changes.
   return <CerbosProviderForRule key={props.ruleId} {...props} />;
 };
 
@@ -283,14 +243,12 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   engineOptions,
   refreshIntervalSeconds = 300,
   requestTimeout = 10_000,
-  batchInterval = 50,
-  maxBatchSize = 10,
   onDecision,
   onUpdateError,
   onValidationError,
   decodeJWTPayload,
 }) => {
-  // The cached bundle read from disk at startup (`undefined` while reading).
+  // The cached bundle (`undefined` until the cache has been read).
   const [initialBundle, setInitialBundle] = useState<
     SerializedBundle | null | undefined
   >(undefined);
@@ -299,23 +257,10 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   const [updateError, setUpdateError] = useState<string | undefined>(
     undefined
   );
-  // Requests currently handed to the WebView for evaluation.
-  const [batchedRequests, setBatchedRequests] =
-    useState<SerializablePDPRequests>({});
 
-  const pendingRequests = useRef(new Map<string, PendingRequest>());
-  const queuedRequestIds = useRef<string[]>([]);
-  const batchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Batching settings, readable from the stable `flushQueue` below.
-  const batching = useRef({ batchInterval, maxBatchSize });
-  useEffect(() => {
-    batching.current = { batchInterval, maxBatchSize };
-  }, [batchInterval, maxBatchSize]);
-  const onUpdateErrorRef = useRef(onUpdateError);
-  useEffect(() => {
-    onUpdateErrorRef.current = onUpdateError;
-  }, [onUpdateError]);
-
+  const webView = useRef<PDPWebViewHandle>(null);
+  const pending = useRef(new Map<string, PendingRequest>());
+  const queue = useRef<EvaluateRequest[]>([]);
   const isLoaded = metadata !== undefined;
   const status: CerbosStatus = isLoaded
     ? "ready"
@@ -323,155 +268,60 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
       ? "error"
       : "loading";
 
-  // Load the cached bundle (if any) before starting the WebView, so that the
-  // PDP can start offline.
   useEffect(() => {
     let mounted = true;
-
     readCachedBundle(ruleId)
-      // A cache failure must not stop the PDP from loading from Cerbos Hub.
-      .catch((caught: unknown) => {
-        console.warn("[CerbosProvider] Failed to read cached bundle:", caught);
-        return null;
-      })
+      .catch(() => null) // start without the cache rather than not at all
       .then((bundle) => {
         if (mounted) {
-          debug(
-            bundle
-              ? `[CerbosProvider] Found cached policy bundle ${bundle.metadata.bundleId}`
-              : "[CerbosProvider] No cached policy bundle"
-          );
           setInitialBundle(bundle);
         }
       });
-
     return () => {
       mounted = false;
     };
   }, [ruleId]);
 
-  // Settle a pending request and remove it from the queue.
-  const settleRequest = useCallback(
-    (
-      requestId: string,
-      outcome:
-        | { response: SerializedPDPResponse }
-        | { error: Error; status: "failure" | "timeout" }
-    ) => {
-      const pending = pendingRequests.current.get(requestId);
-      if (!pending) {
-        console.warn(
-          `[CerbosProvider] Received result for unknown or already settled request ${requestId}`
-        );
-        return;
-      }
-
-      pendingRequests.current.delete(requestId);
-      clearTimeout(pending.timeout);
-      queuedRequestIds.current = queuedRequestIds.current.filter(
-        (id) => id !== requestId
-      );
-      setBatchedRequests((current) => omit(current, requestId));
-
-      const elapsed = Date.now() - pending.createdAt;
-      if ("response" in outcome) {
-        debug(`[CerbosProvider] Request ${requestId} succeeded in ${elapsed}ms`);
-        pending.resolve(outcome.response);
-      } else {
-        debug(
-          `[CerbosProvider] Request ${requestId} ${outcome.status} after ${elapsed}ms`
-        );
-        pending.reject(outcome.error);
-      }
-    },
-    []
-  );
-
-  // Hand the next batch of queued requests to the WebView.
-  const flushQueue = useMemo(() => {
-    function flush(): void {
-      batchTimer.current = null;
-
-      const batch = queuedRequestIds.current.splice(
-        0,
-        batching.current.maxBatchSize
-      );
-      if (batch.length === 0) {
-        return;
-      }
-
-      setBatchedRequests((current) => {
-        const next = { ...current };
-        for (const requestId of batch) {
-          const pending = pendingRequests.current.get(requestId);
-          if (pending) {
-            next[requestId] = pending.request;
-          }
-        }
-        debug(
-          `[CerbosProvider] Sending batch of ${batch.length} request(s) to the WebView`
-        );
-        return next;
-      });
-
-      if (queuedRequestIds.current.length > 0) {
-        batchTimer.current = setTimeout(flush, batching.current.batchInterval);
-      }
+  // Send everything queued in this tick to the WebView in one call.
+  const flush = useCallback(() => {
+    const batch = queue.current.splice(0);
+    if (batch.length > 0) {
+      webView.current?.evaluate(batch);
     }
-
-    return flush;
   }, []);
 
-  // Queue a request for the WebView and wait for its (serialized) response.
   const submit = useCallback(
     (requestId: string, request: PDPRequest): Promise<SerializedPDPResponse> => {
       if (!isLoaded) {
-        return Promise.reject(
-          new Error(error ?? "Cerbos PDP is not loaded yet")
-        );
+        return Promise.reject(new Error(error ?? "Cerbos PDP is not loaded yet"));
       }
 
-      return new Promise<SerializedPDPResponse>((resolve, reject) => {
+      return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
-          settleRequest(requestId, {
-            status: "timeout",
-            error: new Error(
-              `Cerbos request ${requestId} timed out after ${requestTimeout}ms`
-            ),
-          });
-        }, requestTimeout);
-
-        pendingRequests.current.set(requestId, {
-          request,
-          resolve,
-          reject,
-          timeout,
-          createdAt: Date.now(),
-        });
-        queuedRequestIds.current.push(requestId);
-        debug(
-          `[CerbosProvider] Queued ${request.kind} request ${requestId} (queue size: ${queuedRequestIds.current.length})`
-        );
-
-        if (!batchTimer.current) {
-          batchTimer.current = setTimeout(
-            flushQueue,
-            batching.current.batchInterval
+          pending.current.delete(requestId);
+          reject(
+            new Error(`Cerbos request ${requestId} timed out after ${requestTimeout}ms`)
           );
+        }, requestTimeout);
+        pending.current.set(requestId, { resolve, reject, timeout });
+
+        queue.current.push({ requestId, request });
+        if (queue.current.length === 1) {
+          queueMicrotask(flush);
         }
       });
     },
-    [isLoaded, error, requestTimeout, settleRequest, flushQueue]
+    [isLoaded, error, requestTimeout, flush]
   );
 
   const checkResources = useCallback(
     async (
-      requestData: Omit<CheckResourcesRequest, "requestId">
+      request: Omit<CheckResourcesRequest, "requestId">
     ): Promise<CheckResourcesResponse> => {
       const requestId = newRequestId();
       const result = await submit(requestId, {
         kind: "checkResources",
-        request: { ...requestData, requestId },
+        request: { ...request, requestId },
       });
       if (result.kind !== "checkResources") {
         throw new Error(`Unexpected ${result.kind} response`);
@@ -482,10 +332,11 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   );
 
   const checkResource = useCallback(
-    async (
-      requestData: Omit<CheckResourceRequest, "requestId">
-    ): Promise<CheckResourcesResult> => {
-      const { resource, actions, ...rest } = requestData;
+    async ({
+      resource,
+      actions,
+      ...rest
+    }: Omit<CheckResourceRequest, "requestId">): Promise<CheckResourcesResult> => {
       const response = await checkResources({
         ...rest,
         resources: [{ resource, actions }],
@@ -500,10 +351,10 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   );
 
   const isAllowed = useCallback(
-    async (
-      requestData: Omit<IsAllowedRequest, "requestId">
-    ): Promise<boolean> => {
-      const { action, ...rest } = requestData;
+    async ({
+      action,
+      ...rest
+    }: Omit<IsAllowedRequest, "requestId">): Promise<boolean> => {
       const result = await checkResource({ ...rest, actions: [action] });
       return result.isAllowed(action) ?? false;
     },
@@ -511,13 +362,11 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   );
 
   const planResources = useCallback(
-    async (
-      requestData: PlanResourcesRequestInput
-    ): Promise<PlanResourcesResponse> => {
+    async (request: PlanResourcesRequestInput): Promise<PlanResourcesResponse> => {
       const requestId = newRequestId();
       const result = await submit(requestId, {
         kind: "planResources",
-        request: { ...requestData, requestId },
+        request: { ...request, requestId },
       });
       if (result.kind !== "planResources") {
         throw new Error(`Unexpected ${result.kind} response`);
@@ -527,51 +376,42 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     [submit]
   );
 
-  // Reject anything still pending when the provider unmounts.
+  // Reject anything still pending on unmount.
   useEffect(() => {
-    const pending = pendingRequests.current;
+    const requests = pending.current;
     return () => {
-      if (batchTimer.current) {
-        clearTimeout(batchTimer.current);
+      for (const [requestId, { reject, timeout }] of requests) {
+        clearTimeout(timeout);
+        reject(new Error(`Cerbos request ${requestId} cancelled: provider unmounted`));
       }
-      for (const [requestId, request] of pending) {
-        clearTimeout(request.timeout);
-        request.reject(
-          new Error(`Cerbos request ${requestId} cancelled: provider unmounted`)
-        );
-      }
-      pending.clear();
+      requests.clear();
     };
   }, []);
 
-  const handleResponse = useCallback(
-    (requestId: string, response: SerializedPDPResponse) => {
-      settleRequest(requestId, { response });
-    },
-    [settleRequest]
-  );
-
-  const handleError = useCallback(
-    (requestId: string, message: string) => {
-      settleRequest(requestId, { status: "failure", error: new Error(message) });
-    },
-    [settleRequest]
-  );
+  const handleResults = useCallback((results: PDPResult[]) => {
+    for (const result of results) {
+      const request = pending.current.get(result.requestId);
+      if (!request) {
+        continue; // timed out
+      }
+      pending.current.delete(result.requestId);
+      clearTimeout(request.timeout);
+      if ("response" in result) {
+        request.resolve(result.response);
+      } else {
+        request.reject(new Error(result.error));
+      }
+    }
+  }, []);
 
   const handleBundleDownloaded = useCallback(
     (bundle: SerializedBundle) => {
-      debug(
-        `[CerbosProvider] Downloaded policy bundle ${bundle.metadata.bundleId} (revision ${bundle.metadata.ruleRevision})`
-      );
       void writeCachedBundle(ruleId, bundle);
     },
     [ruleId]
   );
 
   const handlePDPUpdated = useCallback((updated: PDPMetadata) => {
-    debug(
-      `[CerbosProvider] Embedded PDP ready with bundle ${updated.bundle.bundleId} (from ${updated.source})`
-    );
     setMetadata(updated);
     setError(undefined);
   }, []);
@@ -581,34 +421,26 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     setError(message);
   }, []);
 
-  const handleUpdateResult = useCallback((message: string | null) => {
-    if (message === null) {
-      setUpdateError(undefined);
-      return;
-    }
-    console.warn(`[CerbosProvider] Policy update check failed: ${message}`);
-    setUpdateError(message);
-    onUpdateErrorRef.current?.(message);
-  }, []);
-
-  // The WebView is (re)loading: either starting up, or restarting after the
-  // OS killed its process. Either way the PDP is not ready until the DOM
-  // component reports a bundle again.
-  const handleWebViewLoadStart = useCallback(() => {
-    setMetadata((current) => {
-      if (current !== undefined) {
-        console.warn(
-          "[CerbosProvider] Cerbos WebView is reloading; waiting for the PDP to become ready again"
-        );
+  const notifyUpdateError = useLatest(onUpdateError);
+  const hasUpdateErrorHandler = onUpdateError !== undefined;
+  const handleUpdateResult = useCallback(
+    (message: string | null) => {
+      setUpdateError(message ?? undefined);
+      if (message !== null && hasUpdateErrorHandler) {
+        notifyUpdateError(message);
       }
-      return undefined;
-    });
+    },
+    [hasUpdateErrorHandler, notifyUpdateError]
+  );
+
+  // The WebView is starting, or restarting after the OS killed it: not ready
+  // until the DOM component reports a bundle again.
+  const handleWebViewLoadStart = useCallback(() => {
+    setMetadata(undefined);
   }, []);
 
-  // The WebView does background work only and never shows user content, so
-  // lock it down: no navigation away from the bundled DOM component, no
-  // pop-ups, no link previews. `react-native-webview` (rather than Expo's
-  // lighter DOM WebView) is used because it exposes these controls.
+  // The WebView only does background work, so lock it down.
+  // `react-native-webview` (rather than Expo's DOM WebView) supports these options.
   const domProps = useMemo<DOMProps>(
     () => ({
       style: { height: 0 },
@@ -625,66 +457,101 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     [handleWebViewLoadStart]
   );
 
+  // Every render of the DOM component re-sends all of its props (including the
+  // bundle) across the bridge, so only re-render it when they really change.
+  const stableScopes = useStableValue(scopes);
+  const stableHub = useStableValue(hub);
+  const stableEngineOptions = useStableValue(engineOptions);
+  const logDecisions = useLatest(
+    (entries: SerializedDecisionLogEntry[]) => entries.forEach((entry) => onDecision?.(entry))
+  );
+  const validationErrorHandler = useLatest(onValidationError);
+  const jwtDecoder = useLatest(decodeJWTPayload);
+  const hasDecisionHandler = onDecision !== undefined;
+  const hasValidationErrorHandler = onValidationError !== undefined;
+  const hasJWTDecoder = decodeJWTPayload !== undefined;
+
+  const pdpWebView = useMemo(
+    () =>
+      initialBundle !== undefined && (
+        <View style={{ height: 0, width: 0, opacity: 0 }}>
+          <CerbosEmbeddedPDPWebView
+            ref={webView}
+            ruleId={ruleId}
+            scopes={stableScopes}
+            hub={stableHub}
+            engineOptions={stableEngineOptions}
+            initialBundle={initialBundle}
+            refreshIntervalSeconds={refreshIntervalSeconds}
+            handleBundleDownloaded={handleBundleDownloaded}
+            handlePDPUpdated={handlePDPUpdated}
+            handleLoadError={handleLoadError}
+            handleUpdateResult={handleUpdateResult}
+            handleResults={handleResults}
+            handleDecisionLogs={hasDecisionHandler ? logDecisions : undefined}
+            handleValidationError={
+              hasValidationErrorHandler ? validationErrorHandler : undefined
+            }
+            handleDecodeJWTPayload={hasJWTDecoder ? jwtDecoder : undefined}
+            dom={domProps}
+          />
+        </View>
+      ),
+    [
+      initialBundle,
+      ruleId,
+      stableScopes,
+      stableHub,
+      stableEngineOptions,
+      refreshIntervalSeconds,
+      handleBundleDownloaded,
+      handlePDPUpdated,
+      handleLoadError,
+      handleUpdateResult,
+      handleResults,
+      hasDecisionHandler,
+      logDecisions,
+      hasValidationErrorHandler,
+      validationErrorHandler,
+      hasJWTDecoder,
+      jwtDecoder,
+      domProps,
+    ]
+  );
+
   const contextValue = useMemo<CerbosContextType>(
     () => ({
+      status,
+      isLoaded,
+      metadata,
+      error,
+      updateError,
       checkResources,
       checkResource,
       isAllowed,
       planResources,
-      metadata,
-      status,
-      isLoaded,
-      error,
-      updateError,
     }),
     [
+      status,
+      isLoaded,
+      metadata,
+      error,
+      updateError,
       checkResources,
       checkResource,
       isAllowed,
       planResources,
-      metadata,
-      status,
-      isLoaded,
-      error,
-      updateError,
     ]
   );
 
   return (
     <CerbosContext.Provider value={contextValue}>
       {children}
-      {/* Wait for the cache lookup so the WebView can start with the cached bundle. */}
-      {initialBundle !== undefined && (
-        // The WebView does background work only, so keep it out of sight.
-        <View style={{ height: 0, width: 0, opacity: 0 }}>
-          <CerbosEmbeddedPDPWebView
-            ruleId={ruleId}
-            scopes={scopes}
-            hub={hub}
-            engineOptions={engineOptions}
-            initialBundle={initialBundle}
-            refreshIntervalSeconds={refreshIntervalSeconds}
-            requests={batchedRequests}
-            handleBundleDownloaded={handleBundleDownloaded}
-            handlePDPUpdated={handlePDPUpdated}
-            handleLoadError={handleLoadError}
-            handleUpdateResult={handleUpdateResult}
-            handleResponse={handleResponse}
-            handleError={handleError}
-            handleDecisionLog={onDecision}
-            handleValidationError={onValidationError}
-            handleDecodeJWTPayload={decodeJWTPayload}
-            dom={domProps}
-          />
-        </View>
-      )}
+      {pdpWebView}
     </CerbosContext.Provider>
   );
 };
 
-/**
- * Access the embedded Cerbos PDP provided by the nearest {@link CerbosProvider}.
- */
 export const useCerbos = (): CerbosContextType => {
   const context = useContext(CerbosContext);
   if (context === undefined) {
