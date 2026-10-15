@@ -14,13 +14,10 @@ import { useColorScheme } from "@/hooks/useColorScheme";
 
 import { DemoProvider } from "@/components/demo/DemoContext";
 
-// Prevent the splash screen from auto-hiding before asset loading is complete.
 SplashScreen.preventAutoHideAsync();
 
-// `DemoProvider` renders the `CerbosProvider` with the configuration from the
-// "ePDP" tab (defaulting to EXPO_PUBLIC_CERBOS_HUB_RULE_ID) and collects
-// decision logs for the "Audit" tab. In your own app, render `CerbosProvider`
-// here directly; see `components/demo/DemoContext.tsx` for the props it takes.
+// `DemoProvider` renders `CerbosProvider` with settings the ePDP tab can
+// change. In your app, render `CerbosProvider` here directly.
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();

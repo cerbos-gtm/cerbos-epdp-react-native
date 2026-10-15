@@ -17,11 +17,7 @@ const defaultRequest: PlanResourcesRequestInput = {
   includeMetadata: true,
 };
 
-/**
- * Edit any `planResources` request as JSON and run it. The response is a
- * query plan: always allowed, always denied, or a condition (an expression
- * tree) to apply when listing resources.
- */
+/** The response is always allowed, always denied, or a condition to filter a list by. */
 export default function PlanResourcesScreen() {
   const { planResources } = useCerbos();
 
