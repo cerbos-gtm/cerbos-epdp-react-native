@@ -1,0 +1,111 @@
+name: Update embedded PDP
+
+# Bumps @cerbos/embedded-client and @cerbos/embedded-server (which ships the
+# `server.wasm` engine asset) together, and opens a PR if either changed.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: update-embedded-pdp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  EXPO_NO_TELEMETRY: "1"
+  CI: "1"
+  BRANCH: automation/update-embedded-pdp
+
+jobs:
+  update:
+    name: Update embedded PDP packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Record current versions
+        id: before
+        run: |
+          {
+            echo "client=$(node -p 'require("@cerbos/embedded-client/package.json").version')"
+            echo "server=$(node -p 'require("@cerbos/embedded-server/package.json").version')"
+            echo "cerbos=$(node -p 'require("@cerbos/embedded-server").metadata.cerbosVersion')"
+          } >> "$GITHUB_OUTPUT"
+
+      # Take the latest client, then the newest server that satisfies the
+      # client's peer range, so the pair is always compatible.
+      - name: Install latest compatible versions
+        run: |
+          client=$(npm view @cerbos/embedded-client@latest version)
+          range=$(npm view "@cerbos/embedded-client@${client}" peerDependencies --json | jq -r '."@cerbos/embedded-server"')
+          server=$(npm view "@cerbos/embedded-server@${range}" version --json | jq -r 'if type == "array" then last else . end')
+          echo "client=${client} server=${server} (peer range ${range})"
+          npm install --save-exact "@cerbos/embedded-client@${client}" "@cerbos/embedded-server@${server}"
+
+      - name: Record new versions
+        id: after
+        run: |
+          {
+            echo "client=$(node -p 'require("@cerbos/embedded-client/package.json").version')"
+            echo "server=$(node -p 'require("@cerbos/embedded-server/package.json").version')"
+            echo "cerbos=$(node -p 'require("@cerbos/embedded-server").metadata.cerbosVersion')"
+            echo "checksum=$(node -p 'require("@cerbos/embedded-server").metadata.wasmChecksum')"
+          } >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- package.json package-lock.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        id: pr
+        if: steps.after.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          branch: ${{ env.BRANCH }}
+          delete-branch: true
+          add-paths: |
+            package.json
+            package-lock.json
+          signoff: true
+          commit-message: >-
+            Update embedded PDP to Cerbos ${{ steps.after.outputs.cerbos }}
+          title: >-
+            Update embedded PDP to Cerbos ${{ steps.after.outputs.cerbos }}
+          labels: dependencies
+          body: |
+            Updates the embedded PDP packages, including the bundled `server.wasm` engine.
+
+            | Package | From | To |
+            | --- | --- | --- |
+            | `@cerbos/embedded-client` | ${{ steps.before.outputs.client }} | ${{ steps.after.outputs.client }} |
+            | `@cerbos/embedded-server` | ${{ steps.before.outputs.server }} | ${{ steps.after.outputs.server }} |
+            | Cerbos engine | ${{ steps.before.outputs.cerbos }} | ${{ steps.after.outputs.cerbos }} |
+
+            New `server.wasm` SHA-256: `${{ steps.after.outputs.checksum }}`
+
+            Opened by the [Update embedded PDP](${{ github.server_url }}/${{ github.repository }}/actions/workflows/update-embedded-pdp.yml) workflow.
+
+      # Pushes made with GITHUB_TOKEN don't trigger `pull_request` workflows,
+      # but `workflow_dispatch` is allowed, so run CI on the PR branch.
+      - name: Run CI on the PR branch
+        if: steps.pr.outputs.pull-request-operation == 'created' || steps.pr.outputs.pull-request-operation == 'updated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref "$BRANCH"
