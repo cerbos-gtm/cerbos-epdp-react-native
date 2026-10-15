@@ -376,17 +376,17 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
     [submit]
   );
 
-  // Reject anything still pending on unmount.
-  useEffect(() => {
-    const requests = pending.current;
-    return () => {
-      for (const [requestId, { reject, timeout }] of requests) {
-        clearTimeout(timeout);
-        reject(new Error(`Cerbos request ${requestId} cancelled: provider unmounted`));
-      }
-      requests.clear();
-    };
+  const rejectPending = useCallback((reason: string) => {
+    queue.current.length = 0;
+    for (const [requestId, { reject, timeout }] of pending.current) {
+      clearTimeout(timeout);
+      reject(new Error(`Cerbos request ${requestId} cancelled: ${reason}`));
+    }
+    pending.current.clear();
   }, []);
+
+  // Reject anything still pending on unmount.
+  useEffect(() => () => rejectPending("provider unmounted"), [rejectPending]);
 
   const handleResults = useCallback((results: PDPResult[]) => {
     for (const result of results) {
@@ -434,10 +434,12 @@ const CerbosProviderForRule: React.FC<CerbosProviderProps> = ({
   );
 
   // The WebView is starting, or restarting after the OS killed it: not ready
-  // until the DOM component reports a bundle again.
+  // until the DOM component reports a bundle again. Requests sent to the old
+  // page will never be answered, so fail them now rather than at the timeout.
   const handleWebViewLoadStart = useCallback(() => {
     setMetadata(undefined);
-  }, []);
+    rejectPending("the WebView restarted");
+  }, [rejectPending]);
 
   // The WebView only does background work, so lock it down.
   // `react-native-webview` (rather than Expo's DOM WebView) supports these options.

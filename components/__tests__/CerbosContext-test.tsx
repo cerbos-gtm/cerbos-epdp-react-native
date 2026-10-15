@@ -515,6 +515,26 @@ describe("CerbosProvider status and update reporting", () => {
     await markLoaded();
   });
 
+  it("rejects in-flight requests when the WebView restarts", async () => {
+    await renderProvider({ requestTimeout: 60_000 });
+    await markLoaded();
+
+    const promise = context!.checkResources(request);
+    promise.catch(() => {}); // handled below, once the request ID is known
+    const { requestId } = await waitForRequest();
+
+    // The OS killed the WebView's process; Expo reloads it.
+    await act(async () => {
+      mockWebViewProps!.dom!.onLoadStart!({} as never);
+    });
+    await expect(promise).rejects.toThrow(
+      `Cerbos request ${requestId} cancelled: the WebView restarted`
+    );
+
+    // A response from the old page is ignored.
+    await respond(requestId);
+  });
+
   it("locks the WebView down", async () => {
     await renderProvider();
 
